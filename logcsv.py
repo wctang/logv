@@ -2466,9 +2466,11 @@ def logcsv_test():
 
 def show_window(files: list):
     import sys
-    from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
-                                QListView, QFileDialog, QAbstractItemView, QTextEdit, QProgressBar,
-                                QMenu, QMessageBox, QDialog, QLabel, QDialogButtonBox) # 導入 QMessageBox
+    import urllib.request
+    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton,
+                                QListView, QFileDialog, QAbstractItemView, QTextEdit, QProgressBar, QMenu,
+                                QMessageBox, QDialog, QLabel, QDialogButtonBox, QMenuBar)
+    from PySide6.QtGui import QAction
     from PySide6.QtCore import QObject, QThread, Signal, Slot, QStringListModel, Qt, QUrl
     import threading
 
@@ -2657,13 +2659,13 @@ def show_window(files: list):
 
 
 
-    class FileSelectionApp(QWidget):
+    class FileSelectionApp(QMainWindow):
         sig_process_file = Signal(str)
         # sig_interrupt = Signal(str)
 
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("檔案選擇應用程式")
+            self.setWindowTitle("LogCsv - Log to CSV Converter")
             self.setGeometry(100, 100, 600, 600)
 
             self.file_list_model = QStringListModel()
@@ -2671,6 +2673,7 @@ def show_window(files: list):
 
             self.init_thread()
             self.init_ui()
+            self._create_menu()
             self.setAcceptDrops(True) # 啟用拖放功能
 
         def init_thread(self):
@@ -2690,8 +2693,9 @@ def show_window(files: list):
             self.thread.start()
 
         def init_ui(self):
-            layout = QVBoxLayout()
-
+            central_widget = QWidget()
+            self.setCentralWidget(central_widget)
+            layout = QVBoxLayout(central_widget)
             # 選擇檔案按鈕
             self.select_button = QPushButton("選擇檔案")
             self.select_button.clicked.connect(self.open_file_dialog)
@@ -2724,8 +2728,61 @@ def show_window(files: list):
             self.progress_bar.setValue(0)
             layout.addWidget(self.progress_bar)
 
-            self.setLayout(layout)
+        def _create_menu(self):
+            menubar = self.menuBar()
+            help_menu = menubar.addMenu("Help")
+            update_action = QAction("Update", self)
+            update_action.triggered.connect(self.update_script)
+            help_menu.addAction(update_action)
 
+        def update_script(self):
+            """Downloads the latest version of the script and replaces the current one."""
+            update_url = "https://raw.githubusercontent.com/wctang/logv/refs/heads/main/logcsv.py"
+
+            reply = QMessageBox.question(self, "Update",
+                                         f"This will download the latest version from:\n{update_url}\n\nAnd replace the current script. Are you sure you want to continue?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+            if reply == QMessageBox.Yes:
+                try:
+                    self.statusBar().showMessage("Updating...")
+                    QApplication.processEvents()
+
+                    with urllib.request.urlopen(update_url, timeout=15) as response:
+                        if response.getcode() == 200:
+                            new_script_content = response.read()
+                            script_path = os.path.abspath(sys.argv[0])
+
+                            if not script_path.lower().endswith('.py'):
+                                QMessageBox.warning(self, "Update Not Supported", "Automatic update is only supported when running as a .py script.")
+                                self.statusBar().clearMessage()
+                                return
+
+                            timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+                            backup_path = f"{script_path}.{timestamp_str}.bak"
+                            try:
+                                # Rename current script to backup
+                                os.rename(script_path, backup_path)
+                            except OSError as e:
+                                QMessageBox.critical(self, "Update Failed", f"Could not back up current script: {e}")
+                                self.statusBar().clearMessage()
+                                return
+
+                            try:
+                                # Write the new script
+                                with open(script_path, 'wb') as f:
+                                    f.write(new_script_content)
+
+                                QMessageBox.information(self, "Update Complete", f"Update successful! Old version backed up to:\n{backup_path}\n\nPlease restart the application.")
+                            except OSError as e:
+                                QMessageBox.critical(self, "Update Failed", f"An error occurred while writing the new file: {e}\nAttempting to restore from backup.")
+                                os.rename(backup_path, script_path)
+                            self.statusBar().clearMessage()
+                        else:
+                            raise Exception(f"Failed to download. Status code: {response.getcode()}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Update Failed", f"An error occurred during the update:\n{e}")
+                    self.statusBar().clearMessage()
         def open_file_dialog(self):
             filenames, _ = QFileDialog.getOpenFileNames(self, "選擇檔案", "", "所有檔案 (*.*)")
             if filenames:
