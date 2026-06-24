@@ -1,0 +1,13 @@
+.vscode/
+__pycache__/
+db_tools/
+logs/
+_old/
+_power-analysis/
+_analysis/
+*.db-shm
+*.db-wal
+*.xz
+*.zip
+*.log
+*.pyz

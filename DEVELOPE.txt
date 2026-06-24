@@ -1,0 +1,32 @@
+== 建議修改項目 ==
+- 建議不要使用 database, 改使用純文字附加模式寫入
+  - database 常會損壞。
+  - log 只需要依序寫入及讀取，database 的功能無意義。
+  - 純文字附加模式可以在主要程式寫入開啟時，其他程式讀取或是複製。這樣可以讓客戶直接複製當下的 log 不用停下 ccs.
+- 每個記錄檔開頭應有必要的資訊:
+  - log schema type, version
+  - 專案(設備)id, 名稱, 時區
+  - 所有"格式化資料"的欄位 schema 定義
+- "非格式化資料":
+  <timestamp>|<src>|<level 0 - 9>|log message
+- "格式化資料"
+  - schema 必須先於 data 出現，最好是每個檔案最開頭就定義完所有的 schema。
+  - 跟隨 csv (RFC 4180) 格式。UTF-8, 逗號分隔, 一筆一行, 含特殊文字(如逗號)的資料需用"", 數字單純10進位,不要 hex 或 binary. 可小數, 可負數, 可空值，如數值有單位 (W, kW, V, A, %, Hz...) 應在欄位名註明。
+  - 欄位 schema 定義
+  <timestamp>|<src>|<schema_key>|<schema description>:<column1>,<column2>,<column3>,<column3>,...
+  - 資料
+  <timestamp>|<src>|<schema_key>|<data1>,<data2>,<data3>,<data3>,...
+或
+  <timestamp>|<src>|log level|<schema_key>(<schema description>):<column1>,<column2>,<column3>,<column3>,...
+  <timestamp>|<src>|log level|<schema_key>:<data1>,<data2>,<data3>,<data3>,...
+
+- ccs 應把本身內部資訊以格式化資料輸出
+- 如數值有非直觀解讀方式 (eg. servo alarm), 將原數值及解讀後資訊都一併記錄.
+
+- ccs 啟動時將非當天的 log 進行壓縮，推薦使用 zstd 格式。
+
+== 或是另一種輸出方式 (無需 log 檔轉 csv 檔) ==
+- 格式化資料 直接輸出 csv 檔，不同格式寫入不同檔案
+- 非格式化資料寫入個別 log 檔
+- 每天輸出到一個目錄，目錄下有多個檔案。
+- ccs 啟動時將非當天的 log 進行壓縮，每天壓成一個檔案。
