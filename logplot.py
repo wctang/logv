@@ -459,10 +459,26 @@ class CSVPlotViewer(QMainWindow):
                             self.statusBar().clearMessage()
                             return
 
-                        with open(script_path, 'wb') as f:
-                            f.write(new_script_content)
+                        timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+                        backup_path = f"{script_path}.{timestamp_str}.bak"
+                        try:
+                            # Rename current script to backup
+                            os.rename(script_path, backup_path)
+                        except OSError as e:
+                            QMessageBox.critical(self, "Update Failed", f"Could not back up current script: {e}")
+                            self.statusBar().clearMessage()
+                            return
 
-                        QMessageBox.information(self, "Update Complete", "Update successful! Please restart the application.")
+                        try:
+                            # Write the new script
+                            with open(script_path, 'wb') as f:
+                                f.write(new_script_content)
+
+                            QMessageBox.information(self, "Update Complete", f"Update successful! Old version backed up to:\n{backup_path}\n\nPlease restart the application.")
+                        except OSError as e:
+                            QMessageBox.critical(self, "Update Failed", f"An error occurred while writing the new file: {e}\nAttempting to restore from backup.")
+                            # Restore from backup
+                            os.rename(backup_path, script_path)
                         self.statusBar().clearMessage()
                     else:
                         raise Exception(f"Failed to download. Status code: {response.getcode()}")
