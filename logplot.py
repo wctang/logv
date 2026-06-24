@@ -16,6 +16,7 @@ import random
 import os
 import json
 import time
+import urllib.request
 from argparse import ArgumentParser
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -31,7 +32,7 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260603"
+VERSION = "20260624"
 
 
 class DraggableLabelItem(pg.TextItem):
@@ -377,6 +378,10 @@ class CSVPlotViewer(QMainWindow):
         usage_action.triggered.connect(self.show_usage_dialog)
         help_menu.addAction(usage_action)
 
+        update_action = QAction("Update", self)
+        update_action.triggered.connect(self.update_script)
+        help_menu.addAction(update_action)
+
 
     def show_usage_dialog(self):
         help_text = f"""
@@ -410,23 +415,60 @@ class CSVPlotViewer(QMainWindow):
 <ul>
     <li>將 CSV 檔案拖放到視窗中以載入。</li>
     <li><b>File -> Open CSV Files:</b> 選擇並載入 CSV 檔案。</li>
+    <li><b>File -> Save State:</b> 儲存目前的狀態 (載入的檔案、勾選的曲線、顏色、縮放等) 到檔案。</li>
+    <li><b>File -> Load State:</b> 載入先前儲存的狀態。</li>
     <li><b>Timezone:</b> 切換時區，以不同 UTC 偏移量顯示時間。</li>
+    <li><b>Help -> Update:</b> 從網路上下載並更新程式至最新版本。</li>
 </ul>
 <h3>樹狀圖與清單操作:</h3>
 <ul>
     <li><b>過濾框 (Filter):</b> 輸入文字過濾顯示的資料列。</li>
-    <li><b>右鍵選單 (檔案層級):</b> 載入該檔案的訊號描述檔 (SignalList)、清除該檔案所有選取、移除該檔案。</li>
+    <li><b>右鍵選單 (檔案層級):</b> 載入該檔案的訊號描述檔 (SignalList)、清除該檔案所有選取、移除檔案。</li>
     <li><b>右鍵選單 (資料列層級):</b> 更改曲線顏色、手動調整 Y 軸偏移與縮放、產生一次微分 (_1nd)、二次微分 (_2nd) 及絕對值 (_abs) 資料。</li>
     <li><b>右鍵選單 (通用):</b> 展開/折疊全部、勾選/取消勾選所有過濾結果、移除所有檔案。</li>
 </ul>
 <h3>搜尋與文字資料功能:</h3>
 <ul>
-    <li>在右側樹状圖中勾選要搜尋的文字序列。</li>
+    <li>在右側樹狀圖中勾選要搜尋的文字序列。</li>
     <li>在下方的搜尋框中輸入文字並按 Enter 鍵。</li>
     <li>搜尋結果會顯示在下方表格。雙擊結果可跳轉至對應時間點。</li>
 </ul>
         """
         QMessageBox.about(self, "LogPlot Usage", help_text)
+
+    def update_script(self):
+        """Downloads the latest version of the script and replaces the current one."""
+        update_url = "https://raw.githubusercontent.com/wctang/logv/refs/heads/main/logplot.py"
+
+        reply = QMessageBox.question(self, "Update",
+                                     f"This will download the latest version from:\n{update_url}\n\nAnd replace the current script. Are you sure you want to continue?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            try:
+                self.statusBar().showMessage("Updating...")
+                QApplication.processEvents()
+
+                with urllib.request.urlopen(update_url, timeout=15) as response:
+                    if response.getcode() == 200:
+                        new_script_content = response.read()
+                        script_path = os.path.abspath(sys.argv[0])
+
+                        if not script_path.lower().endswith('.py'):
+                            QMessageBox.warning(self, "Update Not Supported", "Automatic update is only supported when running as a .py script.")
+                            self.statusBar().clearMessage()
+                            return
+
+                        with open(script_path, 'wb') as f:
+                            f.write(new_script_content)
+
+                        QMessageBox.information(self, "Update Complete", "Update successful! Please restart the application.")
+                        self.statusBar().clearMessage()
+                    else:
+                        raise Exception(f"Failed to download. Status code: {response.getcode()}")
+            except Exception as e:
+                QMessageBox.critical(self, "Update Failed", f"An error occurred during the update:\n{e}")
+                self.statusBar().clearMessage()
 
     def set_timezone_offset(self, offset):
         self.x_axis.utcOffset = -offset * 3600
