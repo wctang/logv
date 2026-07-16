@@ -19,6 +19,7 @@ import json
 import sqlite3
 import lzma
 import time
+import csv
 import io
 import pandas as pd
 import zstandard as zstd
@@ -1829,11 +1830,45 @@ def log_item_from_zstd(fpath):
                 yield (f.tell() / fsize_ttl) if fsize_ttl > 0 else 0.0, _process_line(check_num, last)
 
 def log_item_from_csv(fpath):
-    df = pd.read_csv(fpath, low_memory=False, keep_default_na=True, engine="c")
-    rows = len(df)
+    is_file = isinstance(fpath, str)
+    f_bin = None
+    try:
+        if is_file:
+            try:
+                total_size = os.path.getsize(fpath)
+            except FileNotFoundError:
+                return
+            f_bin = open(fpath, 'rb')
+            f_text = io.TextIOWrapper(f_bin, encoding='utf-8', errors='replace')
+        else: # StringIO for testing
+            fpath.seek(0)
+            content = fpath.read()
+            f_bin = io.BytesIO(content.encode('utf-8'))
+            total_size = f_bin.getbuffer().nbytes
+            f_text = io.TextIOWrapper(f_bin, encoding='utf-8', errors='replace')
 
-    for row in df.itertuples():
-        yield row.Index/rows, (row.ts, row.src, row.msg)
+        reader = csv.reader(f_text)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return
+
+        try:
+            ts_idx = header.index('ts')
+            src_idx = header.index('src')
+            msg_idx = header.index('msg')
+        except ValueError:
+            raise ValueError(f"CSV file must have 'ts', 'src', and 'msg' columns. Found: {header}")
+
+        for row in reader:
+            if not row:
+                continue
+
+            progress = f_bin.tell() / total_size if total_size > 0 else 0.0
+            yield progress, (row[ts_idx], row[src_idx], row[msg_idx])
+    finally:
+        if f_bin:
+            f_bin.close()
 
 
 def log_item_from_string(text: str):

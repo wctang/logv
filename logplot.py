@@ -32,12 +32,12 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260624"
+VERSION = "20260716"
 
 
 class DraggableLabelItem(pg.TextItem):
     def __init__(self, text, color, anchor, key, viewer):
-        super().__init__(text=text, color=color, anchor=anchor)
+        super().__init__(anchor=anchor)
         self.key = key
         self.viewer = viewer
         self.is_dragging = False
@@ -45,15 +45,20 @@ class DraggableLabelItem(pg.TextItem):
         self.initial_mouse_y = 0
         self.initial_offset = 0
         self.initial_scale = 1.0
+        self._text = text
         self.update_color(color)
 
     def update_color(self, color):
-        self.setColor(color)
-        bg_color = QColor('black')
-        # bg_color.setAlpha(40) # 加上透明背景，讓文字更明顯
-        self.fill = pg.mkBrush(bg_color)
-        self.border = pg.mkPen(color) # 加上同色邊框
+        self.setText(self._text, color=color)
+        self.border = pg.mkPen(color, width=1)
+        self.fill = pg.mkBrush(0, 0, 0, 180)
         self.update()
+
+    def update_text(self, text):
+        self._text = text
+        color = self.viewer.color_map.get(self.key)
+        if color:
+            self.update_color(color)
 
     def mouseDoubleClickEvent(self, ev):
         if ev.button() == Qt.LeftButton:
@@ -680,10 +685,17 @@ class CSVPlotViewer(QMainWindow):
             child_item = file_item.child(child_row)
             if not child_item:
                 continue
+            
+            key = tuple(child_item.data())
+            _, col_name = key
 
-            if (nn := child_item.text()) in signallist:
-                child_item.setText(nn + ": " + signallist[nn])
+            if col_name in signallist:
+                new_text = col_name + ": " + signallist[col_name]
+                child_item.setText(new_text)
 
+                if key in self.curve_labels:
+                    label = self.curve_labels[key]
+                    label.update_text(new_text)
 
     def _populate_tree(self, file_path, df):
         filename = os.path.basename(file_path)
@@ -725,7 +737,7 @@ class CSVPlotViewer(QMainWindow):
         is_string_type = (df[column_name].dtype in ['object', 'str'])
         if is_string_type and not column_name.endswith('_numeric'):
             unique_vals = df[column_name].dropna().unique()
-            if 1 < len(unique_vals) < 10:
+            if len(unique_vals) < 15:
                 mapping = {val: i for i, val in enumerate(unique_vals)}
                 values = df[column_name].map(mapping).to_numpy(dtype=float)
             else: # Should not happen for a plotted curve, but as a safeguard
@@ -795,7 +807,7 @@ class CSVPlotViewer(QMainWindow):
 
                 # 檢查獨立字串數量，如果小於10，則當作分類數據繪圖
                 unique_vals = df[column_name].dropna().unique()
-                if 1 < len(unique_vals) < 10:
+                if len(unique_vals) < 15:
                     # 建立字串到整數的映射
                     mapping = {val: i for i, val in enumerate(unique_vals)}
                     df[column_name + '_numeric'] = df[column_name].map(mapping)
@@ -813,10 +825,9 @@ class CSVPlotViewer(QMainWindow):
                     vb.addItem(curve)
                     self.curves[key] = (curve, vb)
 
-                    # 為字串轉換的曲線也加上標籤
-                    _, col_name_only = key
+                    label_text = item.text()
                     color = self.color_map[key]
-                    label = DraggableLabelItem(text=col_name_only, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
+                    label = DraggableLabelItem(text=label_text, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
                     self.curve_labels[key] = label
                     vb.addItem(label, ignoreBounds=True)
 
@@ -863,9 +874,9 @@ class CSVPlotViewer(QMainWindow):
                 vb.addItem(curve)
                 self.curves[key] = (curve, vb)
 
-                _, col_name_only = key
+                label_text = item.text()
                 color = self.color_map[key]
-                label = DraggableLabelItem(text=col_name_only, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
+                label = DraggableLabelItem(text=label_text, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
                 self.curve_labels[key] = label
                 vb.addItem(label, ignoreBounds=True)
 
