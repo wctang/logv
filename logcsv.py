@@ -24,6 +24,8 @@ import io
 import pandas as pd
 import zstandard as zstd
 
+VERSION = "20260717"
+
 class SchemaErrorException(Exception):
     pass
 
@@ -2773,51 +2775,65 @@ def show_window(files: list):
         def update_script(self):
             """Downloads the latest version of the script and replaces the current one."""
             update_url = "https://raw.githubusercontent.com/wctang/logv/refs/heads/main/logcsv.py"
-
-            reply = QMessageBox.question(self, "Update",
-                                         f"This will download the latest version from:\n{update_url}\n\nAnd replace the current script. Are you sure you want to continue?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-
-            if reply == QMessageBox.Yes:
-                try:
+    
+            try:
+                self.statusBar().showMessage("Checking for updates...")
+                QApplication.processEvents()
+    
+                with urllib.request.urlopen(update_url, timeout=15) as response:
+                    if response.getcode() != 200:
+                        raise Exception(f"Failed to download. Status code: {response.getcode()}")
+                    
+                    new_script_content_bytes = response.read()
+                    new_script_content = new_script_content_bytes.decode('utf-8', errors='ignore')
+    
+                    match = re.search(r'VERSION\s*=\s*["\'](\d+)["\']', new_script_content)
+                    if not match:
+                        raise Exception("Could not find version in the new script.")
+                    
+                    online_version = match.group(1)
+    
+                    if online_version == VERSION:
+                        QMessageBox.information(self, "No Update Needed", f"You are already using the latest version ({VERSION}).")
+                        return
+    
+                    reply = QMessageBox.question(self, "Update Available",
+                                                 f"A new version ({online_version}) is available. Your current version is {VERSION}.\n\n"
+                                                 f"This will download the latest version from:\n{update_url}\n\n"
+                                                 "And replace the current script. Are you sure you want to continue?",
+                                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+    
+                    if reply == QMessageBox.No:
+                        return
+    
                     self.statusBar().showMessage("Updating...")
                     QApplication.processEvents()
-
-                    with urllib.request.urlopen(update_url, timeout=15) as response:
-                        if response.getcode() == 200:
-                            new_script_content = response.read()
-                            script_path = os.path.abspath(sys.argv[0])
-
-                            if not script_path.lower().endswith('.py'):
-                                QMessageBox.warning(self, "Update Not Supported", "Automatic update is only supported when running as a .py script.")
-                                self.statusBar().clearMessage()
-                                return
-
-                            timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
-                            backup_path = f"{script_path}.{timestamp_str}.bak"
-                            try:
-                                # Rename current script to backup
-                                os.rename(script_path, backup_path)
-                            except OSError as e:
-                                QMessageBox.critical(self, "Update Failed", f"Could not back up current script: {e}")
-                                self.statusBar().clearMessage()
-                                return
-
-                            try:
-                                # Write the new script
-                                with open(script_path, 'wb') as f:
-                                    f.write(new_script_content)
-
-                                QMessageBox.information(self, "Update Complete", f"Update successful! Old version backed up to:\n{backup_path}\n\nPlease restart the application.")
-                            except OSError as e:
-                                QMessageBox.critical(self, "Update Failed", f"An error occurred while writing the new file: {e}\nAttempting to restore from backup.")
-                                os.rename(backup_path, script_path)
-                            self.statusBar().clearMessage()
-                        else:
-                            raise Exception(f"Failed to download. Status code: {response.getcode()}")
-                except Exception as e:
-                    QMessageBox.critical(self, "Update Failed", f"An error occurred during the update:\n{e}")
-                    self.statusBar().clearMessage()
+    
+                    script_path = os.path.abspath(sys.argv[0])
+    
+                    if not script_path.lower().endswith('.py'):
+                        QMessageBox.warning(self, "Update Not Supported", "Automatic update is only supported when running as a .py script.")
+                        return
+    
+                    timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+                    backup_path = f"{script_path}.{timestamp_str}.bak"
+                    try:
+                        os.rename(script_path, backup_path)
+                    except OSError as e:
+                        raise OSError(f"Could not back up current script: {e}")
+    
+                    try:
+                        with open(script_path, 'wb') as f:
+                            f.write(new_script_content_bytes)
+                        QMessageBox.information(self, "Update Complete", f"Update successful! Old version backed up to:\n{backup_path}\n\nPlease restart the application.")
+                    except OSError as e:
+                        QMessageBox.critical(self, "Update Failed", f"An error occurred while writing the new file: {e}\nAttempting to restore from backup.")
+                        os.rename(backup_path, script_path)
+            
+            except Exception as e:
+                QMessageBox.critical(self, "Update Failed", f"An error occurred during the update:\n{e}")
+            finally:
+                self.statusBar().clearMessage()
         def open_file_dialog(self):
             filenames, _ = QFileDialog.getOpenFileNames(self, "選擇檔案", "", "所有檔案 (*.*)")
             if filenames:
