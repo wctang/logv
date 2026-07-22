@@ -24,7 +24,7 @@ import io
 import pandas as pd
 import zstandard as zstd
 
-VERSION = "20260717"
+VERSION = "20260721"
 
 class SchemaErrorException(Exception):
     pass
@@ -1695,6 +1695,57 @@ def prepare_process_rules(pathpre):
 
 
 
+    # schema_key -----------------------------------------------------
+    def schema_key():
+        re1 = re.compile(r'^(\w+)\((.*)\):')
+        srcs_check = []
+        srcs = {}
+        writers = {}
+        finished = False
+
+        def process_log(ts, src, msg:str):
+            if finished:
+                return True
+
+            if src not in srcs_check:
+                # check first message is schema def
+                srcs_check.append(src)
+                if m1 := re1.match(msg):
+                    schema_key = m1.group(1)
+                    schema_def = msg[m1.end():]
+                    srcs[src] = schema_key
+
+                    writers[src] = get_writer(pathpre, schema_key, src)
+                    writers[src].write(f"timestamp,{schema_def}\n")
+                    return True
+            
+            if src in srcs:
+                schema_key = srcs[src]+":"
+                if not msg.startswith(schema_key):
+                    return False
+                
+                writers[src].write(f"{timestamp_str(ts)},{msg[len(schema_key):]}\n")
+                return True
+
+            return False
+
+        def process_result():
+            res = {}
+            for src, writer in writers.items():
+                if not (rr := writer.close()):
+                    continue
+
+                res[rr[0]] = rr[1]
+            nonlocal finished
+            finished = True
+            return res
+
+        return process_log, process_result
+
+    process_rules.append(schema_key())
+
+
+
 
 
     # -----------------------------------------------------
@@ -2002,6 +2053,23 @@ def process_csv_test(text):
 
 
 def logcsv_test():
+
+    # schema_key
+    print("== schema_key")
+    res = process_test('''1782962797759418|40|0|0|2|ABB_PSTX105_Analog_Filters(ref to monitoring_targets for details):Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1
+1782962797759590|35|0|0|2|AB_PowerFlex_525_Basic_Filters(ref to monitoring_targets for details):Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C
+1782962798517053|40|0|0|2|ABB_PSTX105_Analog_Filters:0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901
+1782962798551382|35|0|0|2|AB_PowerFlex_525_Basic_Filters:27411,1907,30812,8509,22259,23785,1221,17189,9441,17802
+1782962799309368|40|0|0|2|ABB_PSTX105_Analog_Filters:1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753
+1782962799340907|35|0|0|2|AB_PowerFlex_525_Basic_Filters:12507,25970,8359,2559,26186,26898,31062,932,30749,1510
+1782962800086452|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+1782962800116325|35|0|0|2|AB_PowerFlex_525_Basic_Filters:30371,17266,18673,29377,30112,30010,28135,17444,19290,17986
+1782962800860532|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+''')
+    assert res == {'_ABB_PSTX105_Analog_Filters_40.csv': ['timestamp,Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1\n', '2026-07-02 03:26:38.517053,0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901\n', '2026-07-02 03:26:39.309368,1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753\n', '2026-07-02 03:26:40.086452,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n', '2026-07-02 03:26:40.860532,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n'], '_AB_PowerFlex_525_Basic_Filters_35.csv': ['timestamp,Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C\n', '2026-07-02 03:26:38.551382,27411,1907,30812,8509,22259,23785,1221,17189,9441,17802\n', '2026-07-02 03:26:39.340907,12507,25970,8359,2559,26186,26898,31062,932,30749,1510\n', '2026-07-02 03:26:40.116325,30371,17266,18673,29377,30112,30010,28135,17444,19290,17986\n']}, res
+
+
+    # FOLV
     print("== FOLV")
     res = process_test('''1752066312941361|0|0|0|2|PROG-START(I-RIDE_RCS_2.0_1.0.10_v1.0.10):
 1752066312953302|0|0|0|1|log_tag_info-{ "log_type":"info", "name":"EX_PLC", "tags":["RCS_HEARTBEAT","RCS_PLC_ALARM_CLEAR","RCS_PLAYBLE_POLIT_1","RCS_PLAYBLE_POLIT_2","RW_RESERVE_0","RW_RESERVE_1","RW_RESERVE_2","RW_RESERVE_3","F1_PN1_READY_POLIT_1","F1_PN1_READY_POLIT_2","F1_PN1_ALLOW_POLIT_1","F1_PN1_ALLOW_POLIT_2","F1_ENTRANCE_DOOR_OPEN","F1_ENTRANCE_DOOR_CLOSE","F1_EXIT_DOOR_OPEN","F1_EXIT_DOOR_CLOSE","RW_RESERVE_4","RW_RESERVE_5","RW_RESERVE_6","RW_RESERVE_7","RW_RESERVE_8","RW_RESERVE_9","RW_RESERVE_10","RW_RESERVE_11","F2_PN1_READY_POLIT_1","F2_PN1_READY_POLIT_2","F2_PN1_ALLOW_POLIT_1","F2_PN1_ALLOW_POLIT_2","F2_ENTRANCE_DOOR_OPEN","F2_ENTRANCE_DOOR_CLOSE","F2_EXIT_DOOR_OPEN","F2_EXIT_DOOR_CLOSE","RW_RESERVE_12","RW_RESERVE_13","RW_RESERVE_14","RW_RESERVE_15","RW_RESERVE_16","RW_RESERVE_17","RW_RESERVE_18","RW_RESERVE_19","EXT_RIDE_START","EXT_E_STOP_DISABLE","EXT_RIDE_RUNNING","EXT_RIDE_AUTO","RW_RESERVE_20","RW_RESERVE_21","RW_RESERVE_22","RW_RESERVE_23","POWER_NORMAL","UPS_POWER_NORMAL","U1_SHUTDOWN_MODE","U2_SHUTDOWN_MODE","U3_SHUTDOWN_MODE","U4_SHUTDOWN_MODE","PLAY_EVENT","CLEAR_ALARM_EVENT","STOP_EVENT","UNIT_RETURN_EVENT","MC_E_STOP_EVENT","R_F1_SLIDING_BARRIER1_CLOSED","R_F1_SLIDING_BARRIER2_CLOSED","R_GWD_SECURED","R_FIRE_ALARM_EVENT","R_EARTHQUAKE_EVENT","F1_PN1_E_STOP_EVENT","F1_PN1_MAINTENANCE_MODE","F1_PN1_READY_EVENT","F1_DOOR_ALL_CLOSED","F1_SB_ALL_SECURE","F1_ACTUATOR_UNSECURE","F1_ENTRANCE_DOOR_AT_CLOSE_POSITION","F1_EXIT_DOOR_AT_CLOSE_POSITION","F1_ALL_GATE_AT_HOME_POSITION","R_RESERVE_7","R_RESERVE_8","R_RESERVE_9","R_RESERVE_10","R_RESERVE_11","R_RESERVE_12","R_RESERVE_13","F2_PN1_E_STOP_EVENT","F2_PN1_MAINTENANCE_MODE","F2_PN1_READY_EVENT","F2_DOOR_ALL_CLOSED","F2_SB_ALL_SECURE","F2_ACTUATOR_UNSECURE","F2_ENTRANCE_DOOR_AT_CLOSE_POSITION","F2_EXIT_DOOR_AT_CLOSE_POSITION","F2_ALL_GATE_AT_HOME_POSITION","R_RESERVE_18","R_RESERVE_19","R_RESERVE_20","R_RESERVE_21","R_RESERVE_22","R_RESERVE_23","PLC_HAS_ALARM","HEARTBEAT_IS_NOT_OK_FROM_RCS","PW_RIO_DISCONNECTED","PW_RIO_SDI1_ALARM","PW_RIO_DI1_ALARM","EX_RIO_DISCONNECTED","EX_RIO_SDI1_ALARM","EX_RIO_SDI2_ALARM","EX_RIO_SDI3_ALARM","EX_RIO_SDI4_ALARM","EX_RIO_SDI5_ALARM","EX_RIO_DI1_ALARM","EX_RIO_DO1_ALARM","EX_RIO_DO2_ALARM","HW_ALARM_RESERVE_0","HW_ALARM_RESERVE_1","HW_ALARM_RESERVE_2","HW_ALARM_RESERVE_3","HW_ALARM_RESERVE_4","HW_ALARM_RESERVE_5","HW_ALARM_RESERVE_6","HW_ALARM_RESERVE_7","HW_ALARM_RESERVE_8","HW_ALARM_RESERVE_9","HW_ALARM_RESERVE_10","HW_ALARM_RESERVE_11","HW_ALARM_RESERVE_12","HW_ALARM_RESERVE_13","HW_ALARM_RESERVE_14","HW_ALARM_RESERVE_15","HW_ALARM_RESERVE_16","HW_ALARM_RESERVE_17","HW_ALARM_RESERVE_18","MC_E_STOP_ENABLE","MC_E_STOP_INCONSISTENT","F1_PN1_E_STOP_ENABLE","F1_PN1_E_STOP_INCONSISTENT","F2_PN1_E_STOP_ENABLE","F2_PN1_E_STOP_INCONSISTENT","F1_THEATRE_ENTRANCE_DOOR_CLOSED_INCONSISTENT","F1_THEATRE_EXIT_DOOR_CLOSED_INCONSISTENT","F2_THEATRE_ENTRANCE_DOOR_CLOSED_INCONSISTENT","F2_THEATRE_EXIT_DOOR_CLOSED_INCONSISTENT","F1_PN1_MAINTENANCE_MODE_INCONSISTENT","F2_PN1_MAINTENANCE_MODE_INCONSISTENT","NORMAL_MODE_NOT_GWD_INCONSISTENT","F1_GWD_SLIDING_BARRIER1_CLOSED_INCONSISTENT","F1_GWD_SLIDING_BARRIER2_CLOSED_INCONSISTENT","U1_NORMAL_MODE_INCONSISTENT","U2_NORMAL_MODE_INCONSISTENT","U3_NORMAL_MODE_INCONSISTENT","U4_NORMAL_MODE_INCONSISTENT","UNIT1_SAFETY_CONNECTION_ERROR","UNIT2_SAFETY_CONNECTION_ERROR","UNIT3_SAFETY_CONNECTION_ERROR","UNIT4_SAFETY_CONNECTION_ERROR","ERR_ALARM_RESERVE_5","ERR_ALARM_RESERVE_6","ERR_ALARM_RESERVE_7","ERR_ALARM_RESERVE_8","ERR_ALARM_RESERVE_9","ERR_ALARM_RESERVE_10","ERR_ALARM_RESERVE_11","ERR_ALARM_RESERVE_12","ERR_ALARM_RESERVE_13","1F_INTRUSION","2F_INTRUSION","SW_ALARM_RESERVE_0","SW_ALARM_RESERVE_1","SW_ALARM_RESERVE_2","SW_ALARM_RESERVE_3","SW_ALARM_RESERVE_4","SW_ALARM_RESERVE_5","SWITCH_SENSOR_STUCK_ON_NO_PASS","PP_UNIT1_SWITCH_NO_PASS","PP_UNIT2_SWITCH_NO_PASS","PP_UNIT3_SWITCH_NO_PASS","PP_UNIT4_SWITCH_NO_PASS","F1_SWITCH_NO_PASS","F2_SWITCH_NO_PASS","MC_E_STOP_NO_PASS","F1_E_STOP_NO_PASS","F2_E_STOP_NO_PASS","SW_ALARM_RESERVE_16","SW_ALARM_RESERVE_17","SW_ALARM_RESERVE_18","SW_ALARM_RESERVE_19","SW_ALARM_RESERVE_20","SW_ALARM_RESERVE_21","SW_ALARM_RESERVE_22","START_PLAY_BUTTON_PRESSED_INCONSISTENT","F1_PN1_FLOOR_READY_INCONSISTENT","F2_PN1_FLOOR_READY_INCONSISTENT","WARNING_RESERVE_0","WARNING_RESERVE_1","WARNING_RESERVE_2","WARNING_RESERVE_3","RAW_PW_SDI1_01","RAW_PW_SDI1_02","RAW_PW_SDI1_03","RAW_PW_SDI1_04","RAW_PW_SDI1_05","RAW_PW_SDI1_06","RAW_PW_SDI1_07","RAW_PW_SDI1_08","RAW_PW_DI1_01","RAW_PW_DI1_02","RAW_PW_DI1_03","RAW_PW_DI1_04","RAW_PW_DI1_05","RAW_PW_DI1_06","RAW_PW_DI1_07","RAW_PW_DI1_08","RAW_PW_DI1_09","RAW_PW_DI1_10","RAW_PW_DI1_11","RAW_PW_DI1_12","RAW_PW_DI1_13","RAW_PW_DI1_14","RAW_PW_DI1_15","RAW_PW_DI1_16","RAW_EX_SDI1_01","RAW_EX_SDI1_02","RAW_EX_SDI1_03","RAW_EX_SDI1_04","RAW_EX_SDI1_05","RAW_EX_SDI1_06","RAW_EX_SDI1_07","RAW_EX_SDI1_08","RAW_EX_SDI2_01","RAW_EX_SDI2_02","RAW_EX_SDI2_03","RAW_EX_SDI2_04","RAW_EX_SDI2_05","RAW_EX_SDI2_06","RAW_EX_SDI2_07","RAW_EX_SDI2_08","RAW_EX_SDI3_01","RAW_EX_SDI3_02","RAW_EX_SDI3_03","RAW_EX_SDI3_04","RAW_EX_SDI3_05","RAW_EX_SDI3_06","RAW_EX_SDI3_07","RAW_EX_SDI3_08","RAW_EX_SDI4_01","RAW_EX_SDI4_02","RAW_EX_SDI4_03","RAW_EX_SDI4_04","RAW_EX_SDI4_05","RAW_EX_SDI4_06","RAW_EX_SDI4_07","RAW_EX_SDI4_08","RAW_EX_SDI5_01","RAW_EX_SDI5_02","RAW_EX_SDI5_03","RAW_EX_SDI5_04","RAW_EX_SDI5_05","RAW_EX_SDI5_06","RAW_EX_SDI5_07","RAW_EX_SDI5_08","RAW_EX_DI1_01","RAW_EX_DI1_02","RAW_EX_DI1_03","RAW_EX_DI1_04","RAW_EX_DI1_05","RAW_EX_DI1_06","RAW_EX_DI1_07","RAW_EX_DI1_08","RAW_EX_DI1_09","RAW_EX_DI1_10","RAW_EX_DI1_11","RAW_EX_DI1_12","RAW_EX_DI1_13","RAW_EX_DI1_14","RAW_EX_DI1_15","RAW_EX_DI1_16","RAW_EX_DO1_01","RAW_EX_DO1_02","RAW_EX_DO1_03","RAW_EX_DO1_04","RAW_EX_DO1_05","RAW_EX_DO1_06","RAW_EX_DO1_07","RAW_EX_DO1_08","RAW_EX_DO1_09","RAW_EX_DO1_10","RAW_EX_DO1_11","RAW_EX_DO1_12","RAW_EX_DO1_13","RAW_EX_DO1_14","RAW_EX_DO1_15","RAW_EX_DO1_16","RAW_EX_DO2_01","RAW_EX_DO2_02","RAW_EX_DO2_03","RAW_EX_DO2_04","RAW_EX_DO2_05","RAW_EX_DO2_06","RAW_EX_DO2_07","RAW_EX_DO2_08","RAW_EX_DO2_09","RAW_EX_DO2_10","RAW_EX_DO2_11","RAW_EX_DO2_12","RAW_EX_DO2_13","RAW_EX_DO2_14","RAW_EX_DO2_15","RAW_EX_DO2_16","EX_PLC_F_SIGNATURE_1","EX_PLC_F_SIGNATURE_2","EX_PLC_VERSION_MAJOR","EX_PLC_VERSION_FEATURE","EX_PLC_VERSION_FIX"]}
