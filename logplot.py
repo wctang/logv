@@ -36,6 +36,34 @@ from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 VERSION = "20260717"
 
 
+class SeriesState:
+    """Holds all per-series runtime state: color, adjustment, plot items and labels."""
+    def __init__(self, filepath, column_name):
+        self.filepath = filepath
+        self.column_name = column_name
+
+        h = random.randint(0, 359)
+        s = random.randint(150, 255)
+        v = random.randint(200, 255)
+        self.color = QColor.fromHsv(h, s, v)                  # QColor
+
+        value_item = QStandardItem("")
+        value_item.setEditable(False)
+        self.value_item = value_item        # QStandardItem (tree live value)
+
+        self.adjustment = (0.0, 1.0)        # (y_offset, y_scale)
+        self.curve = None                   # PlotDataItem
+        self.vb = None                      # ViewBox the curve lives in
+        self.label = None                   # DraggableLabelItem
+        self.value_label = None             # pg.TextItem (crosshair value)
+
+    @property
+    def is_active(self):
+        """True when the curve has been added to the plot."""
+        return self.curve is not None
+
+
+
 class DraggableLabelItem(pg.TextItem):
     def __init__(self, text, color, anchor, key, viewer):
         super().__init__(anchor=anchor)
@@ -47,19 +75,19 @@ class DraggableLabelItem(pg.TextItem):
         self.initial_offset = 0
         self.initial_scale = 1.0
         self._text = text
-        self.update_color(color)
+        self._color = color
+        self.update_text(text)
 
     def update_color(self, color):
-        self.setText(self._text, color=color)
-        self.border = pg.mkPen(color, width=1)
-        self.fill = pg.mkBrush(0, 0, 0, 180)
-        self.update()
+        self._color = color
+        self.update_text(self._text)
 
     def update_text(self, text):
         self._text = text
-        color = self.viewer.color_map.get(self.key)
-        if color:
-            self.update_color(color)
+        self.setText(self._text, color=self._color)
+        self.border = pg.mkPen(self._color, width=1)
+        self.fill = pg.mkBrush(0, 0, 0, 180)
+        self.update()
 
     def mouseDoubleClickEvent(self, ev):
         if ev.button() == Qt.LeftButton:
@@ -87,7 +115,8 @@ class DraggableLabelItem(pg.TextItem):
             view_pos = vb.mapSceneToView(ev.scenePos())
             self.initial_mouse_y = view_pos.y()
             # Get the current adjustments
-            self.initial_offset, self.initial_scale = self.viewer.curve_adjustments.get(self.key, (0.0, 1.0))
+            s = self.viewer.series.get(self.key)
+            self.initial_offset, self.initial_scale = s.adjustment if s else (0.0, 1.0)
         else:
             ev.ignore()
 
@@ -150,12 +179,7 @@ class CSVPlotViewer(QMainWindow):
 
         # 初始化資料結構
         self.dataframes = {}    # file_path -> DataFrame
-        self.curves = {}        # (file_path, column_name) -> (PlotDataItem, ViewBox)
-        self.curve_labels = {}  # (file_path, column_name) -> TextItem
-        self.curve_value_labels = {}  # (file_path, column_name) -> TextItem
-        self.color_map = {}     # (file_path, column_name) -> QColor
-        self.curve_adjustments = {}  # (file_path, column_name) -> (y_offset, y_scale)
-        self.value_items = {}   # (file_path, column_name) -> QStandardItem (for live value display in tree)
+        self.series = {}        # (file_path, column_name) -> SeriesState
         self.file_items = {}    # file_path -> QStandardItem (for tracking tree nodes)
         self.active_text_series = set() # 用於追蹤已勾選的字串系列
 
@@ -208,7 +232,10 @@ class CSVPlotViewer(QMainWindow):
         self.plot_widget.scene().addItem(self.second_vb)
         self.plot_widget.getAxis('right').linkToView(self.second_vb)
         self.second_vb.setXLink(self.main_vb)
-        self.second_vb.setMenuEnabled(False)
+        # self.second_vb.setMenuEnabled(False)
+        for action in self.second_vb.menu.actions():
+            if "View All" not in action.text():
+                action.setVisible(False)
 
         self.mouse_vb = pg.ViewBox()
         self.plot_widget.scene().addItem(self.mouse_vb)
@@ -509,16 +536,12 @@ class CSVPlotViewer(QMainWindow):
 
 
     def select_csv_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open CSV Files", "", "CSV Files (*.csv *.csv.zst *.csv.zstd)"
-        )
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open CSV Files", "", "CSV Files (*.csv *.csv.zst *.csv.zstd)")
         if file_paths:
             self.load_csv_files(file_paths)
 
     def select_signallist_for_file(self, file_item):
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Load SignalList Files", "", "CSV Files (*.csv)"
-        )
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Load SignalList Files", "", "CSV Files (*.csv)")
         if file_paths:
             self.load_signallist_files(file_paths, file_item)
 
@@ -546,8 +569,9 @@ class CSVPlotViewer(QMainWindow):
                 if child_item.checkState() == Qt.Checked:
                     key = child_item.data()
                     col_name = key[1]
-                    color = self.color_map.get(key, QColor(Qt.white)).name()
-                    offset, scale = self.curve_adjustments.get(key, (0.0, 1.0))
+                    s = self.series.get(key)
+                    color = s.color.name() if s else QColor(Qt.white).name()
+                    offset, scale = s.adjustment if s else (0.0, 1.0)
                     state["series"].append({
                         "file_path": fpath,
                         "column_name": col_name,
@@ -580,20 +604,21 @@ class CSVPlotViewer(QMainWindow):
         if files_to_load:
             self.load_csv_files(files_to_load)
 
-        for s in state.get("series", []):
-            key = (s["file_path"], s["column_name"])
-            if key in self.color_map:
-                self.color_map[key] = QColor(s.get("color", "#FFFFFF"))
-
-            self.curve_adjustments[key] = (s.get("y_offset", 0.0), s.get("y_scale", 1.0))
+        for entry in state.get("series", []):
+            key = (entry["file_path"], entry["column_name"])
+            ss = self.series.get(key)
+            if ss:
+                ss.color = QColor(entry.get("color", "#FFFFFF"))
+                ss.adjustment = (entry.get("y_offset", 0.0), entry.get("y_scale", 1.0))
 
             for row in range(self.model.rowCount()):
                 file_item = self.model.item(row)
-                if file_item and file_item.data() == s["file_path"]:
+                if file_item and file_item.data() == entry["file_path"]:
                     for child_row in range(file_item.rowCount()):
                         child_item = file_item.child(child_row)
                         if child_item and child_item.data() == key:
-                            child_item.setForeground(QBrush(self.color_map.get(key, QColor(Qt.white))))
+                            color = self.series[key].color if key in self.series else QColor(Qt.white)
+                            child_item.setForeground(QBrush(color))
                             child_item.setCheckState(Qt.Checked)
                             break
                     break
@@ -703,9 +728,9 @@ class CSVPlotViewer(QMainWindow):
                 new_text = col_name + ": " + signallist[col_name]
                 child_item.setText(new_text)
 
-                if key in self.curve_labels:
-                    label = self.curve_labels[key]
-                    label.update_text(new_text)
+                ss = self.series.get(key)
+                if ss and ss.label:
+                    ss.label.update_text(new_text)
 
     def _populate_tree(self, file_path, df):
         filename = os.path.basename(file_path)
@@ -717,56 +742,35 @@ class CSVPlotViewer(QMainWindow):
         for col in df.columns:
             key = (file_path, col)
 
-            if key not in self.color_map:
-                h = random.randint(0, 359)
-                s = random.randint(150, 255)
-                v = random.randint(200, 255)
-                self.color_map[key] = QColor.fromHsv(h, s, v)
+            if key not in self.series:
+                self.series[key] = SeriesState(file_path, col)
 
-            color = self.color_map[key]
+            color = self.series[key].color
 
             child_item = QStandardItem(col)
             child_item.setCheckable(True)
             child_item.setData(key)
             child_item.setForeground(QBrush(color))
 
-            value_item = QStandardItem("")
-            value_item.setEditable(False)
-            self.value_items[key] = value_item
-            file_item.appendRow([child_item, value_item])
+            file_item.appendRow([child_item, self.series[key].value_item])
 
         # Add to model after all children are appended to avoid multiple UI refresh signals
         self.model.appendRow(file_item)
 
 
-    def _create_or_update_curve(self, key):
+    def _create_or_update_curve(self, key, curve_mapping = None):
         file_path, column_name = key
         df = self.dataframes[file_path]
         timestamps = df.index.astype(np.int64) / 1e9
 
-        is_string_type = (df[column_name].dtype in ['object', 'str'])
-        if is_string_type and not column_name.endswith('_numeric'):
-            unique_vals = df[column_name].dropna().unique()
-            if len(unique_vals) < 15:
-                mapping = {val: i for i, val in enumerate(unique_vals)}
-                values = df[column_name].map(mapping).to_numpy(dtype=float)
-            else: # Should not happen for a plotted curve, but as a safeguard
-                values = np.full(len(timestamps), np.nan)
+        if curve_mapping is not None:
+            values = curve_mapping.to_numpy(dtype=float)
         else:
             values = df[column_name].to_numpy(dtype=float)
 
-        # print(values)
-        color_key = (file_path, column_name)
-        if color_key not in self.color_map and column_name.endswith('_numeric'):
-            original_col_name = column_name.removesuffix('_numeric')
-            color_key = (file_path, original_col_name)
-        color = self.color_map[color_key]
+        color = self.series[key].color
 
-        adj_key = key
-        if adj_key not in self.curve_adjustments and column_name.endswith('_numeric'):
-            original_col_name = column_name.removesuffix('_numeric')
-            adj_key = (file_path, original_col_name)
-        y_offset, y_scale = self.curve_adjustments.get(adj_key, (0.0, 1.0))
+        y_offset, y_scale = self.series[key].adjustment if key in self.series else (0.0, 1.0)
 
         if np.isnan(values).all():
             base = 0.0
@@ -779,11 +783,12 @@ class CSVPlotViewer(QMainWindow):
 
         adjusted_values = (values - base) * y_scale + base + y_offset
 
-        if key not in self.curves:
-            curve = PlotDataItem(x=timestamps, y=adjusted_values, pen=pg.mkPen(color=color), paint=None)
+        ss = self.series.get(key)
+        if ss and ss.curve:
+            curve = ss.curve
+            ss.curve.setData(x=timestamps, y=adjusted_values)
         else:
-            curve, _ = self.curves[key]
-            curve.setData(x=timestamps, y=adjusted_values)
+            curve = PlotDataItem(x=timestamps, y=adjusted_values, pen=pg.mkPen(color=color), paint=None)
 
         if self.show_markers:
             curve.setSymbol('x')
@@ -802,7 +807,9 @@ class CSVPlotViewer(QMainWindow):
 
 
     def _find_none_overlap_offset(self):
-        y_max_values = [c.y_max_val for c, v in self.curves.values() if v == self.second_vb and hasattr(c, 'y_max_val') and not np.isnan(c.y_max_val)]
+        y_max_values = [ss.curve.y_max_val for ss in self.series.values()
+                        if ss.is_active and ss.vb == self.second_vb
+                        and hasattr(ss.curve, 'y_max_val') and not np.isnan(ss.curve.y_max_val)]
         new_offset = max(y_max_values) + 1.5 if y_max_values else 0.0
         return (new_offset, 1.0)
 
@@ -816,40 +823,41 @@ class CSVPlotViewer(QMainWindow):
         is_string_type = (df[column_name].dtype in ['object', 'str'])
 
         if item.checkState() == Qt.Checked:
-            if key in self.curves:
+            ss = self.series.get(key)
+            if ss and ss.is_active:
                 return
 
             if is_string_type:
                 # 檢查獨立字串數量，如果小於15，則當作分類數據繪圖
                 unique_vals = df[column_name].dropna().unique()
                 if len(unique_vals) < 15:
+                    # 為新的分類曲線計算一個不重疊的 Y 軸偏移
+                    if ss and ss.adjustment == (0.0, 1.0):
+                        ss.adjustment = self._find_none_overlap_offset()
+
                     # 建立字串到整數的映射
                     mapping = {val: i for i, val in enumerate(unique_vals)}
-                    df[column_name + '_numeric'] = df[column_name].map(mapping)
-
-                    # 為新的分類曲線計算一個不重疊的 Y 軸偏移
-                    if key not in self.curve_adjustments:
-                        self.curve_adjustments[key] = self._find_none_overlap_offset()
+                    curve_mapping = df[column_name].map(mapping)
 
                     # 建立曲線
-                    curve = self._create_or_update_curve((file_path, column_name + '_numeric'))
+                    curve = self._create_or_update_curve(key, curve_mapping)
                     vb = self.second_vb # 在右邊的 ViewBox 繪製
                     vb.addItem(curve)
-                    self.curves[key] = (curve, vb)
+                    ss.curve = curve
+                    ss.vb = vb
 
                     label_text = item.text()
-                    color = self.color_map[key]
-                    label = DraggableLabelItem(text=label_text, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
-                    self.curve_labels[key] = label
+                    label = DraggableLabelItem(text=label_text, color=ss.color, anchor=(-0.1, 0.5), key=key, viewer=self)
+                    ss.label = label
                     vb.addItem(label, ignoreBounds=True)
 
-                    value_label = pg.TextItem("", color=color, anchor=(-0.1, 0.5))
+                    value_label = pg.TextItem("", color=ss.color, anchor=(-0.1, 0.5))
                     value_label.setVisible(False)
                     bg_color = QColor('black')
                     bg_color.setAlpha(150)
                     value_label.fill = pg.mkBrush(bg_color)
                     vb.addItem(value_label, ignoreBounds=True)
-                    self.curve_value_labels[key] = value_label
+                    ss.value_label = value_label
 
                     if vb.state['autoRange'][1]:
                         y_bounds = vb.childrenBounds()[1]
@@ -859,7 +867,6 @@ class CSVPlotViewer(QMainWindow):
                             vb.setYRange(0, 1)
                         vb.state['autoRange'][1] = True
                     self.update_label_positions()
-                    df.drop(columns=[column_name + '_numeric'], inplace=True)
                 else:
                     self.active_text_series.add(key)
                     self.update_crosshair(self.current_timestamp) # Refresh table for live mode
@@ -867,8 +874,8 @@ class CSVPlotViewer(QMainWindow):
                 values = df[column_name].to_numpy(dtype=float)
                 unique_vals = np.unique(values[~np.isnan(values)])
                 if len(unique_vals) < 3:
-                    if key not in self.curve_adjustments:
-                        self.curve_adjustments[key] = self._find_none_overlap_offset()
+                    if ss and ss.adjustment == (0.0, 1.0):
+                        ss.adjustment = self._find_none_overlap_offset()
 
                     vb = self.second_vb
                 else:
@@ -876,21 +883,21 @@ class CSVPlotViewer(QMainWindow):
 
                 curve = self._create_or_update_curve(key)
                 vb.addItem(curve)
-                self.curves[key] = (curve, vb)
+                ss.curve = curve
+                ss.vb = vb
 
                 label_text = item.text()
-                color = self.color_map[key]
-                label = DraggableLabelItem(text=label_text, color=color, anchor=(-0.1, 0.5), key=key, viewer=self)
-                self.curve_labels[key] = label
+                label = DraggableLabelItem(text=label_text, color=ss.color, anchor=(-0.1, 0.5), key=key, viewer=self)
+                ss.label = label
                 vb.addItem(label, ignoreBounds=True)
 
-                value_label = pg.TextItem("", color=color, anchor=(-0.1, 0.5))
+                value_label = pg.TextItem("", color=ss.color, anchor=(-0.1, 0.5))
                 value_label.setVisible(False)
                 bg_color = QColor('black')
                 bg_color.setAlpha(150)
                 value_label.fill = pg.mkBrush(bg_color)
                 vb.addItem(value_label, ignoreBounds=True)
-                self.curve_value_labels[key] = value_label
+                ss.value_label = value_label
 
                 if vb.state['autoRange'][1]:
                     y_bounds = vb.childrenBounds()[1]
@@ -902,16 +909,19 @@ class CSVPlotViewer(QMainWindow):
                 self.update_label_positions()
 
         elif item.checkState() == Qt.Unchecked:
+            ss = self.series.get(key)
             if is_string_type:
-                if key in self.curves:
-                    curve, vb = self.curves.pop(key)
-                    vb.removeItem(curve)
-                    if key in self.curve_labels:
-                        label = self.curve_labels.pop(key)
-                        vb.removeItem(label)
-                    if key in self.curve_value_labels:
-                        val_label = self.curve_value_labels.pop(key)
-                        vb.removeItem(val_label)
+                if ss and ss.is_active:
+                    vb = ss.vb
+                    vb.removeItem(ss.curve)
+                    if ss.label:
+                        vb.removeItem(ss.label)
+                    if ss.value_label:
+                        vb.removeItem(ss.value_label)
+                    ss.curve = None
+                    ss.vb = None
+                    ss.label = None
+                    ss.value_label = None
                     if vb.state['autoRange'][1]:
                         y_bounds = vb.childrenBounds()[1]
                         if y_bounds:
@@ -927,15 +937,17 @@ class CSVPlotViewer(QMainWindow):
                     else:
                         self.update_crosshair(self.current_timestamp) # Refresh table for live mode
             else:
-                if key in self.curves:
-                    curve, vb = self.curves.pop(key)
-                    vb.removeItem(curve)
-                    if key in self.curve_labels:
-                        label = self.curve_labels.pop(key)
-                        vb.removeItem(label)
-                    if key in self.curve_value_labels:
-                        val_label = self.curve_value_labels.pop(key)
-                        vb.removeItem(val_label)
+                if ss and ss.is_active:
+                    vb = ss.vb
+                    vb.removeItem(ss.curve)
+                    if ss.label:
+                        vb.removeItem(ss.label)
+                    if ss.value_label:
+                        vb.removeItem(ss.value_label)
+                    ss.curve = None
+                    ss.vb = None
+                    ss.label = None
+                    ss.value_label = None
                     if vb.state['autoRange'][1]:
                         y_bounds = vb.childrenBounds()[1]
                         if y_bounds:
@@ -947,21 +959,20 @@ class CSVPlotViewer(QMainWindow):
     def update_label_positions(self):
         x_min, _ = self.main_vb.viewRange()[0]
 
-        for key, (curve, vb) in self.curves.items():
-            if key not in self.curve_labels:
+        for ss in self.series.values():
+            if not ss.is_active or ss.label is None:
                 continue
 
-            label = self.curve_labels[key]
-
+            curve = ss.curve
             if not hasattr(curve, 'y_min_val') or np.isnan(curve.y_min_val):
-                label.setVisible(False)
+                ss.label.setVisible(False)
                 continue
 
             # 將標籤維持在 Y 軸可視最大最小值的中間
             y_pos = (curve.y_min_val + curve.y_max_val) / 2.0
 
-            label.setVisible(True)
-            label.setPos(x_min, y_pos)
+            ss.label.setVisible(True)
+            ss.label.setPos(x_min, y_pos)
 
     def show_context_menu(self, position):
         index = self.tree_view.indexAt(position)
@@ -1061,24 +1072,16 @@ class CSVPlotViewer(QMainWindow):
         if not file_path:
             return
 
-        # 1. 移除所有相關的曲線和標籤
-        keys_to_remove = [key for key in self.curves if key[0] == file_path]
+        # 1. 移除所有相關的曲線、標籤並清理 series 資料
+        keys_to_remove = [key for key in self.series if key[0] == file_path]
         for key in keys_to_remove:
-            curve, vb = self.curves.pop(key)
-            vb.removeItem(curve)
-            if key in self.curve_labels:
-                label = self.curve_labels.pop(key)
-                vb.removeItem(label)
-            if key in self.curve_value_labels:
-                val_label = self.curve_value_labels.pop(key)
-                vb.removeItem(val_label)
-
-        # 2. 清理所有相關的字典
-        dict_keys_to_remove = [key for key in self.color_map if key[0] == file_path]
-        for key in dict_keys_to_remove:
-            self.color_map.pop(key, None)
-            self.curve_adjustments.pop(key, None)
-            self.value_items.pop(key, None)
+            ss = self.series.pop(key)
+            if ss.is_active:
+                ss.vb.removeItem(ss.curve)
+                if ss.label:
+                    ss.vb.removeItem(ss.label)
+                if ss.value_label:
+                    ss.vb.removeItem(ss.value_label)
         self.file_items.pop(file_path, None)
 
         # 3. 清理已勾選的文字序列
@@ -1097,20 +1100,21 @@ class CSVPlotViewer(QMainWindow):
 
     def change_column_color(self, item):
         key = item.data()
+        ss = self.series.get(key)
+        if ss is None:
+            return
 
-        current_color = self.color_map[key]
-        color_dialog = QColorDialog(current_color, self)
+        color_dialog = QColorDialog(ss.color, self)
         if color_dialog.exec():
             new_color = color_dialog.selectedColor()
-            self.color_map[key] = new_color
+            ss.color = new_color
 
             item.setForeground(QBrush(new_color))
 
-            if key in self.curves:
-                curve, _ = self.curves[key]
-                curve.setPen(color=new_color)
-                if key in self.curve_labels:
-                    self.curve_labels[key].update_color(new_color)
+            if ss.is_active:
+                ss.curve.setPen(color=new_color)
+                if ss.label:
+                    ss.label.update_color(new_color)
 
     def create_derivative_series(self, item, order):
         key = item.data()
@@ -1149,23 +1153,17 @@ class CSVPlotViewer(QMainWindow):
         insert_row_idx = item.row() + 1
         new_key = (file_path, new_col_name)
 
-        if new_key not in self.color_map:
-            h = random.randint(0, 359)
-            s = random.randint(150, 255)
-            v = random.randint(200, 255)
-            self.color_map[new_key] = QColor.fromHsv(h, s, v)
+        if new_key not in self.series:
+            self.series[new_key] = SeriesState(file_path, new_col_name)
 
-        color = self.color_map[new_key]
+        color = self.series[new_key].color
 
         child_item = QStandardItem(new_col_name)
         child_item.setCheckable(True)
         child_item.setData(new_key)
         child_item.setForeground(QBrush(color))
 
-        value_item = QStandardItem("")
-        value_item.setEditable(False)
-        self.value_items[new_key] = value_item
-        file_item.insertRow(insert_row_idx, [child_item, value_item])
+        file_item.insertRow(insert_row_idx, [child_item, self.series[key].value_item])
 
         child_item.setCheckState(Qt.Checked)
 
@@ -1195,29 +1193,24 @@ class CSVPlotViewer(QMainWindow):
         insert_row_idx = item.row() + 1
         new_key = (file_path, new_col_name)
 
-        if new_key not in self.color_map:
-            h = random.randint(0, 359)
-            s = random.randint(150, 255)
-            v = random.randint(200, 255)
-            self.color_map[new_key] = QColor.fromHsv(h, s, v)
+        if new_key not in self.series:
+            self.series[new_key] = SeriesState(file_path, new_col_name)
 
-        color = self.color_map[new_key]
+        color = self.series[new_key].color
 
         child_item = QStandardItem(new_col_name)
         child_item.setCheckable(True)
         child_item.setData(new_key)
         child_item.setForeground(QBrush(color))
 
-        value_item = QStandardItem("")
-        value_item.setEditable(False)
-        self.value_items[new_key] = value_item
-        file_item.insertRow(insert_row_idx, [child_item, value_item])
+        file_item.insertRow(insert_row_idx, [child_item, self.series[key].value_item])
 
         child_item.setCheckState(Qt.Checked)
 
     def adjust_curve_position_scale(self, item):
         key = item.data()
-        current_y_offset, current_y_scale = self.curve_adjustments.get(key, (0.0, 1.0))
+        ss = self.series.get(key)
+        current_y_offset, current_y_scale = ss.adjustment if ss else (0.0, 1.0)
         _, column_name = key
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Adjust Curve: {column_name}")
@@ -1245,29 +1238,17 @@ class CSVPlotViewer(QMainWindow):
         button_layout.addWidget(cancel_button)
         layout.addRow("", button_box)
 
-        apply_button.clicked.connect(lambda: self._apply_curve_adjustments(key, y_offset_spin.value(), y_scale_spin.value(), dialog))
-        reset_button.clicked.connect(lambda: self._apply_curve_adjustments(key, 0.0, 1.0, dialog))
+        apply_button.clicked.connect(lambda: self.update_curve_adjustment(key, y_offset_spin.value(), y_scale_spin.value()))
+        reset_button.clicked.connect(lambda: self.update_curve_adjustment(key, 0.0, 1.0))
         cancel_button.clicked.connect(dialog.reject)
         dialog.exec()
 
-    def _apply_curve_adjustments(self, key, y_offset, y_scale, dialog):
-        if key not in self.curves:
-            return
-
-        self.curve_adjustments[key] = (y_offset, y_scale)
-
-        curve, vb = self.curves[key]
-        vb.removeItem(curve)
-        curve = self._create_or_update_curve(key)
-        vb.addItem(curve)
-
-        self.update_label_positions()
-
     def update_curve_adjustment(self, key, y_offset, y_scale):
-        if key not in self.curves:
+        ss = self.series.get(key)
+        if ss is None or not ss.is_active:
             return
 
-        self.curve_adjustments[key] = (y_offset, y_scale)
+        ss.adjustment = (y_offset, y_scale)
         self._create_or_update_curve(key)
         self.update_label_positions()
 
@@ -1312,8 +1293,9 @@ class CSVPlotViewer(QMainWindow):
         if timestamp is None:
             if not self.in_search_mode:
                 self.bottom_widget.setVisible(False)
-            for label in self.curve_value_labels.values():
-                label.setVisible(False)
+            for ss in self.series.values():
+                if ss.value_label:
+                    ss.value_label.setVisible(False)
             return
 
         self.current_timestamp = int(timestamp)
@@ -1340,7 +1322,8 @@ class CSVPlotViewer(QMainWindow):
             for column_name in df.columns:
                 key = (file_path, column_name)
                 value = closest_row[column_name]
-                value_item = self.value_items.get(key)
+                ss = self.series.get(key)
+                value_item = ss.value_item if ss else None
                 if value_item:
                     if pd.isna(value):
                         value_item.setText("NaN")
@@ -1390,10 +1373,11 @@ class CSVPlotViewer(QMainWindow):
             self.bottom_widget.setVisible(bool(display_data))
 
         # 顯示數值標籤
-        for key, (curve, vb) in self.curves.items():
-            label = self.curve_value_labels.get(key)
-            if not label:
+        for key, ss in self.series.items():
+            if not ss.is_active or ss.value_label is None:
                 continue
+
+            label = ss.value_label
 
             if not self.show_values_mode:
                 label.setVisible(False)
@@ -1419,8 +1403,8 @@ class CSVPlotViewer(QMainWindow):
             if pd.isna(val):
                 label.setVisible(False)
             else:
-                y_offset, y_scale = self.curve_adjustments.get(key, (0.0, 1.0))
-                base = getattr(curve, 'base_val', 0.0)
+                y_offset, y_scale = ss.adjustment
+                base = getattr(ss.curve, 'base_val', 0.0)
                 adjusted_y = (val - base) * y_scale + base + y_offset
 
                 if is_string_type:
@@ -1494,15 +1478,16 @@ class CSVPlotViewer(QMainWindow):
 
         if event.key() == Qt.Key_M:
             self.show_markers = not self.show_markers
-            for key, (curve, _) in self.curves.items():
+            for ss in self.series.values():
+                if not ss.is_active:
+                    continue
                 if self.show_markers:
-                    color = self.color_map[key]
-                    curve.setSymbol('x')
-                    curve.setSymbolSize(4)
-                    curve.setSymbolBrush(color)
-                    curve.setSymbolPen(color)
+                    ss.curve.setSymbol('x')
+                    ss.curve.setSymbolSize(4)
+                    ss.curve.setSymbolBrush(ss.color)
+                    ss.curve.setSymbolPen(ss.color)
                 else:
-                    curve.setSymbol(None)
+                    ss.curve.setSymbol(None)
             event.accept()
             return
 
