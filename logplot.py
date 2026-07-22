@@ -186,7 +186,7 @@ class CSVPlotViewer(QMainWindow):
         self.x_axis = DateAxisItem(orientation='bottom', utcOffset=getOffsetFromUtc())
         self.plot_widget = PlotWidget(axisItems={'bottom': self.x_axis})
         self.plot_widget.showGrid(x=True, y=True)
-        self.plot_widget.addLegend()
+        # self.plot_widget.addLegend()
         self.splitter.addWidget(self.plot_widget)
 
         # Enable zooming and panning with the mouse
@@ -203,22 +203,18 @@ class CSVPlotViewer(QMainWindow):
             if "View All" not in action.text():
                 action.setVisible(False)
 
-        self.second_vb = pg.ViewBox()
         self.plot_widget.showAxis('right')
+        self.second_vb = pg.ViewBox()
         self.plot_widget.scene().addItem(self.second_vb)
         self.plot_widget.getAxis('right').linkToView(self.second_vb)
         self.second_vb.setXLink(self.main_vb)
-        # self.second_vb.setMenuEnabled(False)
-        for action in self.second_vb.menu.actions():
-            if "View All" not in action.text():
-                action.setVisible(False)
+        self.second_vb.setMenuEnabled(False)
 
         self.mouse_vb = pg.ViewBox()
         self.plot_widget.scene().addItem(self.mouse_vb)
         self.mouse_vb.setXLink(self.main_vb)
         self.mouse_vb.setYLink(self.main_vb)
-        # self.mouse_vb.setMenuEnabled(False)
-
+        self.mouse_vb.setMenuEnabled(False)
 
         # Vertical line setup
         self.v_line = pg.InfiniteLine(angle=90, movable=False)
@@ -743,7 +739,7 @@ class CSVPlotViewer(QMainWindow):
         self.model.appendRow(file_item)
 
 
-    def _create_or_update_curve(self, curve, key):
+    def _create_or_update_curve(self, key):
         file_path, column_name = key
         df = self.dataframes[file_path]
         timestamps = df.index.astype(np.int64) / 1e9
@@ -783,12 +779,11 @@ class CSVPlotViewer(QMainWindow):
 
         adjusted_values = (values - base) * y_scale + base + y_offset
 
-        filename = os.path.basename(file_path)
-        legend_name = f"{column_name} ({filename}) (offset={y_offset:.2f}, scale={y_scale:.2f})"
-        if curve is None:
-            curve = PlotDataItem(x=timestamps, y=adjusted_values, pen=pg.mkPen(color=color), paint=None, name=legend_name)
+        if key not in self.curves:
+            curve = PlotDataItem(x=timestamps, y=adjusted_values, pen=pg.mkPen(color=color), paint=None)
         else:
-            curve.setData(x=timestamps, y=adjusted_values, name=legend_name)
+            curve, _ = self.curves[key]
+            curve.setData(x=timestamps, y=adjusted_values)
 
         if self.show_markers:
             curve.setSymbol('x')
@@ -803,7 +798,13 @@ class CSVPlotViewer(QMainWindow):
         curve.y_max_val = (max_val - base) * y_scale + base + y_offset
         curve.base_val = base
 
-        return curve, min_val, max_val
+        return curve
+
+
+    def _find_none_overlap_offset(self):
+        y_max_values = [c.y_max_val for c, v in self.curves.values() if v == self.second_vb and hasattr(c, 'y_max_val') and not np.isnan(c.y_max_val)]
+        new_offset = max(y_max_values) + 1.5 if y_max_values else 0.0
+        return (new_offset, 1.0)
 
     def on_item_changed(self, item):
         if not item.isCheckable() or not item.data():
@@ -815,11 +816,11 @@ class CSVPlotViewer(QMainWindow):
         is_string_type = (df[column_name].dtype in ['object', 'str'])
 
         if item.checkState() == Qt.Checked:
-            if is_string_type:
-                if key in self.curves:
-                    return
+            if key in self.curves:
+                return
 
-                # 檢查獨立字串數量，如果小於10，則當作分類數據繪圖
+            if is_string_type:
+                # 檢查獨立字串數量，如果小於15，則當作分類數據繪圖
                 unique_vals = df[column_name].dropna().unique()
                 if len(unique_vals) < 15:
                     # 建立字串到整數的映射
@@ -828,13 +829,10 @@ class CSVPlotViewer(QMainWindow):
 
                     # 為新的分類曲線計算一個不重疊的 Y 軸偏移
                     if key not in self.curve_adjustments:
-                        y_max_values = [c.y_max_val for c, v in self.curves.values() if v == self.second_vb and hasattr(c, 'y_max_val') and not np.isnan(c.y_max_val)]
-
-                        new_offset = max(y_max_values) + 1.5 if y_max_values else 0.0
-                        self.curve_adjustments[key] = (new_offset, 1.0)
+                        self.curve_adjustments[key] = self._find_none_overlap_offset()
 
                     # 建立曲線
-                    curve, _, _ = self._create_or_update_curve(None, (file_path, column_name + '_numeric'))
+                    curve = self._create_or_update_curve((file_path, column_name + '_numeric'))
                     vb = self.second_vb # 在右邊的 ViewBox 繪製
                     vb.addItem(curve)
                     self.curves[key] = (curve, vb)
@@ -866,25 +864,17 @@ class CSVPlotViewer(QMainWindow):
                     self.active_text_series.add(key)
                     self.update_crosshair(self.current_timestamp) # Refresh table for live mode
             else:
-                if key in self.curves:
-                    return
-
                 values = df[column_name].to_numpy(dtype=float)
-                if np.isnan(values).all():
-                    min_val = np.nan
-                    max_val = np.nan
-                else:
-                    min_val = np.nanmin(values)
-                    max_val = np.nanmax(values)
-
-                if min_val < 10 and max_val < 10:
+                unique_vals = np.unique(values[~np.isnan(values)])
+                if len(unique_vals) < 3:
                     if key not in self.curve_adjustments:
-                        y_max_values = [c.y_max_val for c, v in self.curves.values() if v == self.second_vb and hasattr(c, 'y_max_val') and not np.isnan(c.y_max_val)]
-                        new_offset = max(y_max_values) + 1.5 if y_max_values else 0.0
-                        self.curve_adjustments[key] = (new_offset, 1.0)
+                        self.curve_adjustments[key] = self._find_none_overlap_offset()
 
-                curve, _, _ = self._create_or_update_curve(None, key)
-                vb = self.second_vb if min_val < 10 and max_val < 10 else self.main_vb
+                    vb = self.second_vb
+                else:
+                    vb = self.main_vb
+
+                curve = self._create_or_update_curve(key)
                 vb.addItem(curve)
                 self.curves[key] = (curve, vb)
 
@@ -1268,7 +1258,7 @@ class CSVPlotViewer(QMainWindow):
 
         curve, vb = self.curves[key]
         vb.removeItem(curve)
-        curve, min_val, max_val = self._create_or_update_curve(curve, key)
+        curve = self._create_or_update_curve(key)
         vb.addItem(curve)
 
         self.update_label_positions()
@@ -1278,8 +1268,7 @@ class CSVPlotViewer(QMainWindow):
             return
 
         self.curve_adjustments[key] = (y_offset, y_scale)
-        curve, _ = self.curves[key]
-        self._create_or_update_curve(curve, key)
+        self._create_or_update_curve(key)
         self.update_label_positions()
 
     def clear_all_selections_for_file(self, file_item):
