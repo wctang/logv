@@ -121,8 +121,8 @@ class ZstdCsvWriter:
         self.writer.close()
         return None
 
-def get_writer(pathpre, fname, src):
-    return ZstdCsvWriter(f'{pathpre}_{fname}_{src}.csv.zst') if pathpre else test_writer(f'_{fname}_{src}.csv')
+def get_writer(pathpre, fname):
+    return ZstdCsvWriter(f'{pathpre}_{fname}.csv.zst') if pathpre else test_writer(f'_{fname}.csv')
 
 
 
@@ -187,7 +187,7 @@ def prepare_process_rules(pathpre):
             vv.insert(0, timestamp_str(ts))
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(vv)+"\n")
@@ -231,7 +231,7 @@ def prepare_process_rules(pathpre):
             vv.insert(0, timestamp_str(ts))  # Add timestamp at the beginning
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(vv)+"\n")
@@ -274,7 +274,7 @@ def prepare_process_rules(pathpre):
                 vvv.append(m[0])
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(vvv)+"\n")
@@ -340,7 +340,7 @@ def prepare_process_rules(pathpre):
             assert(len(collect_vals) == len(head)), f"{(ts, msg, collect_vals, head)}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -382,7 +382,7 @@ def prepare_process_rules(pathpre):
             assert(len(collect_vals) == len(head)), f"{(ts, msg, collect_vals, head)}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -426,7 +426,7 @@ def prepare_process_rules(pathpre):
             assert(len(collect_vals) == len(head)), f"{(ts, msg, collect_vals, head)}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -486,7 +486,7 @@ def prepare_process_rules(pathpre):
             assert(len(collect_vals) == len(head)), f"{(ts, msg, collect_vals, head)}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -537,7 +537,7 @@ def prepare_process_rules(pathpre):
             assert(len(collect_vals) == len(head[src])), f"{(len(collect_vals), len(head[src]))} {(ts, msg)}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -570,7 +570,7 @@ def prepare_process_rules(pathpre):
         tried_run_again = False
 
         def write_head(name):
-            writers[name] = get_writer(pathpre, fname, name)
+            writers[name] = get_writer(pathpre, f"{fname}_{name}")
             writers[name].write(f'timestamp,{",".join(heads[name])}\n')
 
         def process_log(ts, src, msg):
@@ -704,7 +704,7 @@ def prepare_process_rules(pathpre):
             assert len(vals) == len(head)
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(vals)+"\n")
@@ -807,7 +807,7 @@ def prepare_process_rules(pathpre):
             assert len(head[m[1]]) == len(vals)
 
             if m[1] not in writers:
-                writers[m[1]] = get_writer(pathpre, fname, m[1])
+                writers[m[1]] = get_writer(pathpre, f"{fname}_{m[1]}")
                 writers[m[1]].write(",".join(head[m[1]])+"\n")
 
             writers[m[1]].write(",".join(vals)+"\n")
@@ -872,7 +872,7 @@ def prepare_process_rules(pathpre):
                 assert src not in head
                 head[src] = schema
                 if src not in writers:
-                    writers[src] = get_writer(pathpre, fname, src)
+                    writers[src] = get_writer(pathpre, f"{fname}_{src}")
                     hh = [name for name, _ in head[src]]
                     writers[src].write(f'timestamp,{",".join(hh)}\n')
 
@@ -930,7 +930,7 @@ def prepare_process_rules(pathpre):
             assert len(head[src]) == len(vals), f"Header length {len(head[src])} != Values length {len(vals)} for src {src}. Message: {msg}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
 
             writers[src].write(",".join(vals)+"\n")
@@ -990,7 +990,7 @@ def prepare_process_rules(pathpre):
             assert len(head[src]) == len(vals), f"Header length {len(head[src])} != Values length {len(vals)} for src {src}. Message: {msg}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
             writers[src].write(",".join(vals)+"\n")
             return True
@@ -1245,7 +1245,7 @@ def prepare_process_rules(pathpre):
 
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
 
             writers[src].write(",".join(vals)+"\n")
@@ -1392,7 +1392,7 @@ def prepare_process_rules(pathpre):
 
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
 
             writers[src].write(",".join(collect_vals)+"\n")
@@ -1536,7 +1536,7 @@ def prepare_process_rules(pathpre):
 
 
                 if src not in writers:
-                    writers[src] = get_writer(pathpre, fname, src)
+                    writers[src] = get_writer(pathpre, f"{fname}_{src}")
                     writers[src].write(",".join(head[src])+"\n")
 
                 writers[src].write(",".join(vals)+"\n")
@@ -1617,7 +1617,7 @@ def prepare_process_rules(pathpre):
             assert len(head[src]) == len(vals), f"Header length {len(head[src])} != Values length {len(vals)} for src {src}. Message: {msg}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head[src])+"\n")
 
             writers[src].write(",".join(vals)+"\n")
@@ -1671,7 +1671,7 @@ def prepare_process_rules(pathpre):
             assert len(head) == len(vals), f"Header length {len(head)} != Values length {len(vals)} for src {src}. Message: {msg}"
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(",".join(vals)+"\n")
@@ -1697,41 +1697,44 @@ def prepare_process_rules(pathpre):
 
     # schema_key -----------------------------------------------------
     def schema_key():
-        re1 = re.compile(r'^(\w+)\((.*)\):')
-        srcs_check = []
+        re1 = re.compile(r'^([\w ]+)(\(([\w ]*)\))?:')
+        re2 = re.compile(r'^([\w ]+):')
         srcs = {}
         writers = {}
         finished = False
 
         def process_log(ts, src, msg:str):
+            if not msg.startswith('#'):
+                return False
+
             if finished:
                 return True
 
-            if src not in srcs_check:
-                # check first message is schema def
-                srcs_check.append(src)
-                if m1 := re1.match(msg):
-                    schema_key = m1.group(1)
-                    schema_def = msg[m1.end():]
-                    srcs[src] = schema_key
+            if msg.startswith('#!'):
+                assert (m := re1.match(msg[2:])), (ts, src, msg)
 
-                    writers[src] = get_writer(pathpre, schema_key, src)
-                    writers[src].write(f"timestamp,{schema_def}\n")
-                    return True
-            
-            if src in srcs:
-                schema_key = srcs[src]+":"
-                if not msg.startswith(schema_key):
-                    return False
-                
-                writers[src].write(f"{timestamp_str(ts)},{msg[len(schema_key):]}\n")
+                key = (src, m[1])
+                assert key not in srcs, (ts, src, msg)
+
+                srcs[key] = True  # TODO, check the column count
+
+                filename = f"{m[3] if m[3] is not None else m[1]}_{src}"
+                writers[key] = get_writer(pathpre, filename)
+                writers[key].write(f"timestamp,{msg[m.end()+2:]}\n")
                 return True
 
-            return False
+            else:
+                assert (m := re2.match(msg[1:])), (ts, src, msg)
+
+                key = (src, m[1])
+                assert key in srcs, (ts, src, msg)
+
+                writers[key].write(f"{timestamp_str(ts)},{msg[len(m[1])+2:]}\n")
+                return True
 
         def process_result():
             res = {}
-            for src, writer in writers.items():
+            for _, writer in writers.items():
                 if not (rr := writer.close()):
                     continue
 
@@ -1764,7 +1767,7 @@ def prepare_process_rules(pathpre):
             # vals.append(f'"{msg}"')
 
             if src not in writers:
-                writers[src] = get_writer(pathpre, fname, src)
+                writers[src] = get_writer(pathpre, f"{fname}_{src}")
                 writers[src].write(",".join(head)+"\n")
 
             writers[src].write(f'{timestamp_str(ts)},"{msg}"\n')
@@ -2054,19 +2057,34 @@ def process_csv_test(text):
 
 def logcsv_test():
 
+#     # schema_key
+#     print("== schema_key")
+#     res = process_test('''1782962797759418|40|0|0|2|ABB_PSTX105_Analog_Filters(ref to monitoring_targets for details):Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1
+# 1782962797759590|35|0|0|2|AB_PowerFlex_525_Basic_Filters(ref to monitoring_targets for details):Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C
+# 1782962798517053|40|0|0|2|ABB_PSTX105_Analog_Filters:0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901
+# 1782962798551382|35|0|0|2|AB_PowerFlex_525_Basic_Filters:27411,1907,30812,8509,22259,23785,1221,17189,9441,17802
+# 1782962799309368|40|0|0|2|ABB_PSTX105_Analog_Filters:1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753
+# 1782962799340907|35|0|0|2|AB_PowerFlex_525_Basic_Filters:12507,25970,8359,2559,26186,26898,31062,932,30749,1510
+# 1782962800086452|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+# 1782962800116325|35|0|0|2|AB_PowerFlex_525_Basic_Filters:30371,17266,18673,29377,30112,30010,28135,17444,19290,17986
+# 1782962800860532|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+# ''')
+#     assert res == {'_ABB_PSTX105_Analog_Filters_40.csv': ['timestamp,Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1\n', '2026-07-02 03:26:38.517053,0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901\n', '2026-07-02 03:26:39.309368,1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753\n', '2026-07-02 03:26:40.086452,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n', '2026-07-02 03:26:40.860532,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n'], '_AB_PowerFlex_525_Basic_Filters_35.csv': ['timestamp,Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C\n', '2026-07-02 03:26:38.551382,27411,1907,30812,8509,22259,23785,1221,17189,9441,17802\n', '2026-07-02 03:26:39.340907,12507,25970,8359,2559,26186,26898,31062,932,30749,1510\n', '2026-07-02 03:26:40.116325,30371,17266,18673,29377,30112,30010,28135,17444,19290,17986\n']}, res
+
     # schema_key
     print("== schema_key")
-    res = process_test('''1782962797759418|40|0|0|2|ABB_PSTX105_Analog_Filters(ref to monitoring_targets for details):Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1
-1782962797759590|35|0|0|2|AB_PowerFlex_525_Basic_Filters(ref to monitoring_targets for details):Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C
-1782962798517053|40|0|0|2|ABB_PSTX105_Analog_Filters:0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901
-1782962798551382|35|0|0|2|AB_PowerFlex_525_Basic_Filters:27411,1907,30812,8509,22259,23785,1221,17189,9441,17802
-1782962799309368|40|0|0|2|ABB_PSTX105_Analog_Filters:1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753
-1782962799340907|35|0|0|2|AB_PowerFlex_525_Basic_Filters:12507,25970,8359,2559,26186,26898,31062,932,30749,1510
-1782962800086452|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
-1782962800116325|35|0|0|2|AB_PowerFlex_525_Basic_Filters:30371,17266,18673,29377,30112,30010,28135,17444,19290,17986
-1782962800860532|40|0|0|2|ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+    res = process_test('''1782962797759418|40|0|0|2|#!ABB_PSTX105_Analog_Filters:Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1
+1782962797759590|35|0|0|2|#!DRV(AB_PowerFlex_525_Basic_Filters):Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C
+1782962798517053|40|0|0|2|#ABB_PSTX105_Analog_Filters:0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901
+1782962798551382|35|0|0|2|#DRV:27411,1907,30812,8509,22259,23785,1221,17189,9441,17802
+1782962799309368|40|0|0|2|#ABB_PSTX105_Analog_Filters:1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753
+1782962799340907|35|0|0|2|#DRV:12507,25970,8359,2559,26186,26898,31062,932,30749,1510
+1782962800086452|40|0|0|2|#ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
+1782962800116325|35|0|0|2|#DRV:30371,17266,18673,29377,30112,30010,28135,17444,19290,17986
+1782962800860532|40|0|0|2|#ABB_PSTX105_Analog_Filters:0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605
 ''')
     assert res == {'_ABB_PSTX105_Analog_Filters_40.csv': ['timestamp,Auto Mode status1 //0:disabled;1:enabled,Event status //0:no active;1:active,Ready To Start //0:fault;1:not fault,FBT Response 0,FBT Response 1,FBT Toggle Bit,Run status //1:gives voltage to the motor,TOR status //1:runs on full voltage,Line //0:line;1:delta,Phase sequence //0:L1L2L3;1:L1L3L2,Start feedback,Stop feedback,Event group 0 status //0:no events,Event group 1 status //0:no events,Event group 2 status //0:no events,Event group 3 status //0:no events,Phase L1 current //0.1A,Phase L2 current1 //0.1A,Phase L3 current1 //0.1A,Max phase current //0.1A,Mains frequency //0.1Hz,Motor voltage //%,Motor temperature percent //%,Number of starts (resettable) //100,Motor run time (resettable) //10h,Top event code //1\n', '2026-07-02 03:26:38.517053,0,0,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24228,23968,27411,1907,30812,22259,23785,1221,17189,31901\n', '2026-07-02 03:26:39.309368,1,1,1,0,0,1,0,1,0,1,1,1,1,0,1,0,24231,1949,12507,25970,8359,26186,26898,31062,932,25753\n', '2026-07-02 03:26:40.086452,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n', '2026-07-02 03:26:40.860532,0,1,0,1,0,1,0,1,0,1,1,1,1,0,1,0,24234,12697,30371,17266,18673,30112,30010,28135,17444,19605\n'], '_AB_PowerFlex_525_Basic_Filters_35.csv': ['timestamp,Output Current //0.01A,Output Voltage //0.1V,DC Bus Voltage //1Vdc,Output Power //0.01kW,Drive Status //00000=[SafetyActive][Decelerating][Accelerating][Forward][Running],Fault 1 Code,Fault 2 Code,Fault 3 Code,Drive Temp //1C,Control Temp //1C\n', '2026-07-02 03:26:38.551382,27411,1907,30812,8509,22259,23785,1221,17189,9441,17802\n', '2026-07-02 03:26:39.340907,12507,25970,8359,2559,26186,26898,31062,932,30749,1510\n', '2026-07-02 03:26:40.116325,30371,17266,18673,29377,30112,30010,28135,17444,19290,17986\n']}, res
+
 
 
     # FOLV
