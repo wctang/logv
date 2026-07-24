@@ -38,7 +38,8 @@ VERSION = "20260717"
 
 class SeriesState:
     """Holds all per-series runtime state: color, adjustment, plot items and labels."""
-    def __init__(self, filepath, column_name, df: pd.DataFrame, timestamps, series_data = None):
+    def __init__(self, viewer, filepath, column_name, df: pd.DataFrame, timestamps, series_data = None):
+        self.viewer = viewer
         self.filepath = filepath
         self.df : pd.DataFrame = df
         self.column_name = column_name
@@ -89,7 +90,7 @@ class SeriesState:
             if self.label:
                 self.label.update_color(new_color)
 
-    def show_marker(self, show = True):
+    def _show_marker(self, show = True):
         if show:
             self.curve.setSymbol('x')
             self.curve.setSymbolSize(4)
@@ -98,6 +99,33 @@ class SeriesState:
         else:
             self.curve.setSymbol(None)
 
+    def clear(self):
+        if self.vb:
+            if self.curve:
+                self.vb.removeItem(self.curve)
+            if self.label:
+                self.vb.removeItem(self.label)
+            if self.value_label:
+                self.vb.removeItem(self.value_label)
+        self.curve = None
+        self.vb = None
+        self.label = None
+        self.value_label = None
+
+    def update_label_position(self, x_min):
+        if self.label is None:
+            return
+
+        curve = self.curve
+        if not hasattr(curve, 'y_min_val') or np.isnan(curve.y_min_val):
+            self.label.setVisible(False)
+            return
+
+        # 將標籤維持在 Y 軸可視最大最小值的中間
+        y_pos = (curve.y_min_val + curve.y_max_val) / 2.0
+
+        self.label.setVisible(True)
+        self.label.setPos(x_min, y_pos)
 
     def text_mapping(self):
         if not self.is_string_type:
@@ -150,7 +178,29 @@ class SeriesState:
         return val, numeric_val, closest_timestamp
 
 
-    def _update_curve(self, vb = None):
+    def _create_curve(self, vb):
+        if self.curve:
+            return
+
+        self.vb = vb
+        self.curve = PlotDataItem(pen=pg.mkPen(color=self.color), paint=None)
+        self.vb.addItem(self.curve)
+
+        self.label = DraggableLabelItem(text=self.column_name, color=self.color, anchor=(-0.1, 0.5), ss=self, viewer=self.viewer)
+        self.vb.addItem(self.label, ignoreBounds=True)
+
+        self.value_label = pg.TextItem("", color=self.color, anchor=(-0.1, 0.5))
+        bg_color = QColor('black')
+        bg_color.setAlpha(150)
+        self.value_label.fill = pg.mkBrush(bg_color)
+        self.value_label.setVisible(False)
+        self.vb.addItem(self.value_label, ignoreBounds=True)
+
+
+    def _update_curve(self, show_marker):
+        if self.curve is None:
+            return
+
         # 建立時判斷是否為文字，是否可轉換為 numpy, 之後就不要一直重複判斷.
 
         if type(self.series_data) == np.ndarray:
@@ -173,19 +223,14 @@ class SeriesState:
 
         adjusted_values = (values - base) * y_scale + base + y_offset
 
-        if self.curve:
-            self.curve.setData(x=self.timestamps, y=adjusted_values)
-        else:
-            self.curve = PlotDataItem(x=self.timestamps, y=adjusted_values, pen=pg.mkPen(color=self.color), paint=None)
+        self.curve.setData(x=self.timestamps, y=adjusted_values)
 
         # 紀錄 Y 軸的最大與最小值，供 Label 定位在垂直置中時使用
         self.curve.y_min_val = (min_val - base) * y_scale + base + y_offset
         self.curve.y_max_val = (max_val - base) * y_scale + base + y_offset
         self.curve.base_val = base
 
-        if vb is not None:
-            vb.addItem(self.curve)
-            self.vb = vb
+        self._show_marker(show_marker)
 
 
 class DraggableLabelItem(pg.TextItem):
@@ -604,14 +649,14 @@ class CSVPlotViewer(QMainWindow):
             with urllib.request.urlopen(update_url, timeout=15) as response:
                 if response.getcode() != 200:
                     raise Exception(f"Failed to download. Status code: {response.getcode()}")
-                
+
                 new_script_content_bytes = response.read()
                 new_script_content = new_script_content_bytes.decode('utf-8', errors='ignore')
 
                 match = re.search(r'VERSION\s*=\s*["\'](\d+)["\']', new_script_content)
                 if not match:
                     raise Exception("Could not find version in the new script.")
-                
+
                 online_version = match.group(1)
 
                 if online_version == VERSION:
@@ -650,7 +695,7 @@ class CSVPlotViewer(QMainWindow):
                 except OSError as e:
                     QMessageBox.critical(self, "Update Failed", f"An error occurred while writing the new file: {e}\nAttempting to restore from backup.")
                     os.rename(backup_path, script_path)
-        
+
         except Exception as e:
             QMessageBox.critical(self, "Update Failed", f"An error occurred during the update:\n{e}")
         finally:
@@ -868,7 +913,7 @@ class CSVPlotViewer(QMainWindow):
         for col in df.columns:
             key = (file_path, col)
             if key not in self.series:
-                self.series[key] = SeriesState(file_path, col, df, timestamps, df[col])
+                self.series[key] = SeriesState(self, file_path, col, df, timestamps, df[col])
 
             file_item.appendRow([self.series[key].child_item, self.series[key].value_item])
 
@@ -882,13 +927,21 @@ class CSVPlotViewer(QMainWindow):
         new_offset = max(y_max_values) + 1.5 if y_max_values else 0.0
         return (new_offset, 1.0)
 
+    def _update_vb_yrange(self, vb):
+        if vb.state['autoRange'][1]:
+            y_bounds = vb.childrenBounds()[1]
+            if y_bounds:
+                vb.setYRange(y_bounds[0], y_bounds[1], padding=0.05)
+            else:
+                vb.setYRange(0, 1)
+            vb.state['autoRange'][1] = True
+
     def on_item_changed(self, item):
         if not item.isCheckable() or not item.data():
             return
 
         ss: SeriesState = item.data()
         df = self.dataframes[ss.filepath]
-        # is_string_type = (df[ss.column_name].dtype in ['object', 'str'])
         key = (ss.filepath, ss.column_name)
 
         if item.checkState() == Qt.Checked:
@@ -898,102 +951,42 @@ class CSVPlotViewer(QMainWindow):
             if ss.is_string_type:
                 # 檢查獨立字串數量，如果小於15，則當作分類數據繪圖
                 unique_vals = df[ss.column_name].dropna().unique()
-                if len(unique_vals) < 15:
-                    # 建立字串到整數的映射
-                    ss.text_mapping()
-
-                    # 為新的分類曲線計算一個不重疊的 Y 軸偏移
-                    if ss and ss.adjustment == (0.0, 1.0):
-                        ss.adjustment = self._find_none_overlap_offset()
-
-                    vb = self.second_vb   # 在右邊的 ViewBox 繪製
-
-                    # 建立曲線
-                    ss._update_curve(vb)
-                    if self.show_markers:
-                        ss.show_marker()
-
-                    label_text = item.text()
-                    label = DraggableLabelItem(text=label_text, color=ss.color, anchor=(-0.1, 0.5), ss=ss, viewer=self)
-                    ss.label = label
-                    vb.addItem(label, ignoreBounds=True)
-
-                    value_label = pg.TextItem("", color=ss.color, anchor=(-0.1, 0.5))
-                    value_label.setVisible(False)
-                    bg_color = QColor('black')
-                    bg_color.setAlpha(150)
-                    value_label.fill = pg.mkBrush(bg_color)
-                    vb.addItem(value_label, ignoreBounds=True)
-                    ss.value_label = value_label
-
-                    if vb.state['autoRange'][1]:
-                        y_bounds = vb.childrenBounds()[1]
-                        if y_bounds:
-                            vb.setYRange(y_bounds[0], y_bounds[1], padding=0.05)
-                        else:
-                            vb.setYRange(0, 1)
-                        vb.state['autoRange'][1] = True
-                    self.update_label_positions()
-                else:
+                if len(unique_vals) >= 15:
                     self.active_text_series.add(key)
                     self.update_crosshair(self.current_timestamp) # Refresh table for live mode
+                    return
+
+                # 建立字串到整數的映射
+                ss.text_mapping()
+
+                # 為新的分類曲線計算一個不重疊的 Y 軸偏移
+                if ss.adjustment == (0.0, 1.0):
+                    ss.adjustment = self._find_none_overlap_offset()
+
+                vb = self.second_vb   # 在右邊的 ViewBox 繪製
             else:
                 values = df[ss.column_name].to_numpy(dtype=float)
                 unique_vals = np.unique(values[~np.isnan(values)])
                 if len(unique_vals) < 3:
-                    if ss and ss.adjustment == (0.0, 1.0):
+                    if ss.adjustment == (0.0, 1.0):
                         ss.adjustment = self._find_none_overlap_offset()
 
                     vb = self.second_vb
                 else:
                     vb = self.main_vb
 
-                ss._update_curve(vb)
-                if self.show_markers:
-                    ss.show_marker()
-
-                label_text = item.text()
-                label = DraggableLabelItem(text=label_text, color=ss.color, anchor=(-0.1, 0.5), ss=ss, viewer=self)
-                ss.label = label
-                vb.addItem(label, ignoreBounds=True)
-
-                value_label = pg.TextItem("", color=ss.color, anchor=(-0.1, 0.5))
-                value_label.setVisible(False)
-                bg_color = QColor('black')
-                bg_color.setAlpha(150)
-                value_label.fill = pg.mkBrush(bg_color)
-                vb.addItem(value_label, ignoreBounds=True)
-                ss.value_label = value_label
-
-                if vb.state['autoRange'][1]:
-                    y_bounds = vb.childrenBounds()[1]
-                    if y_bounds:
-                        vb.setYRange(y_bounds[0], y_bounds[1], padding=0.05)
-                    else:
-                        vb.setYRange(0, 1)
-                    vb.state['autoRange'][1] = True
-                self.update_label_positions()
+            # 建立曲線
+            ss._create_curve(vb)
+            ss._update_curve(self.show_markers)
+            self.update_label_positions()
+            self._update_vb_yrange(vb)
 
         elif item.checkState() == Qt.Unchecked:
             if ss.is_string_type:
                 if ss.is_active:
                     vb = ss.vb
-                    vb.removeItem(ss.curve)
-                    if ss.label:
-                        vb.removeItem(ss.label)
-                    if ss.value_label:
-                        vb.removeItem(ss.value_label)
-                    ss.curve = None
-                    ss.vb = None
-                    ss.label = None
-                    ss.value_label = None
-                    if vb.state['autoRange'][1]:
-                        y_bounds = vb.childrenBounds()[1]
-                        if y_bounds:
-                            vb.setYRange(y_bounds[0], y_bounds[1], padding=0.05)
-                        else:
-                            vb.setYRange(0, 1)
-                        vb.state['autoRange'][1] = True
+                    ss.clear()
+                    self._update_vb_yrange(vb)
                 elif key in self.active_text_series:
                     self.active_text_series.remove(key)
                     # If in search mode, re-run the search. Otherwise, update live view.
@@ -1002,42 +995,20 @@ class CSVPlotViewer(QMainWindow):
                     else:
                         self.update_crosshair(self.current_timestamp) # Refresh table for live mode
             else:
-                if ss and ss.is_active:
+                if ss.is_active:
                     vb = ss.vb
-                    vb.removeItem(ss.curve)
-                    if ss.label:
-                        vb.removeItem(ss.label)
-                    if ss.value_label:
-                        vb.removeItem(ss.value_label)
-                    ss.curve = None
-                    ss.vb = None
-                    ss.label = None
-                    ss.value_label = None
-                    if vb.state['autoRange'][1]:
-                        y_bounds = vb.childrenBounds()[1]
-                        if y_bounds:
-                            vb.setYRange(y_bounds[0], y_bounds[1], padding=0.05)
-                        else:
-                            vb.setYRange(0, 1)
-                        vb.state['autoRange'][1] = True
+                    ss.clear()
+                    self._update_vb_yrange(vb)
 
     def update_label_positions(self):
         x_min, _ = self.main_vb.viewRange()[0]
 
         for ss in self.series.values():
-            if not ss.is_active or ss.label is None:
+            if not ss.is_active:
                 continue
 
-            curve = ss.curve
-            if not hasattr(curve, 'y_min_val') or np.isnan(curve.y_min_val):
-                ss.label.setVisible(False)
-                continue
+            ss.update_label_position(x_min)
 
-            # 將標籤維持在 Y 軸可視最大最小值的中間
-            y_pos = (curve.y_min_val + curve.y_max_val) / 2.0
-
-            ss.label.setVisible(True)
-            ss.label.setPos(x_min, y_pos)
 
     def show_context_menu(self, position):
         index = self.tree_view.indexAt(position)
@@ -1216,7 +1187,7 @@ class CSVPlotViewer(QMainWindow):
         new_key = (ss.filepath, new_col_name)
 
         if new_key not in self.series:
-            self.series[new_key] = SeriesState(ss.filepath, new_col_name, ss.df, ss.timestamps, dy)
+            self.series[new_key] = SeriesState(self, ss.filepath, new_col_name, ss.df, ss.timestamps, dy)
 
         file_item.insertRow(insert_row_idx, [self.series[new_key].child_item, self.series[new_key].value_item])
         self.series[new_key].child_item.setCheckState(Qt.Checked)
@@ -1261,9 +1232,7 @@ class CSVPlotViewer(QMainWindow):
             return
 
         ss.adjustment = (y_offset, y_scale)
-        ss._update_curve()
-        if self.show_markers:
-            ss.show_marker()
+        ss._update_curve(self.show_markers)
         self.update_label_positions()
 
     # def clear_all_selections_for_file(self, file_item):
@@ -1484,13 +1453,7 @@ class CSVPlotViewer(QMainWindow):
             for ss in self.series.values():
                 if not ss.is_active:
                     continue
-                if self.show_markers:
-                    ss.curve.setSymbol('x')
-                    ss.curve.setSymbolSize(4)
-                    ss.curve.setSymbolBrush(ss.color)
-                    ss.curve.setSymbolPen(ss.color)
-                else:
-                    ss.curve.setSymbol(None)
+                ss._show_marker(self.show_markers)
             event.accept()
             return
 
