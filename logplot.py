@@ -47,12 +47,14 @@ class SeriesState:
         self.series_data = series_data
         self.series_data_mapping = None
 
+        self.display_name = self.column_name
+
         h = random.randint(0, 359)
         s = random.randint(150, 255)
         v = random.randint(200, 255)
         self.color = QColor.fromHsv(h, s, v) # QColor
 
-        child_item = QStandardItem(self.column_name)
+        child_item = QStandardItem(self.display_name)
         child_item.setCheckable(True)
         # child_item.setData((self.filepath, self.column_name))
         child_item.setData(self)
@@ -83,12 +85,14 @@ class SeriesState:
     def set_color(self, new_color):
         self.color = new_color
 
-        self.child_item.setForeground(QBrush(new_color))
+        self.child_item.setForeground(QBrush(self.color))
 
         if self.curve is not None:
-            self.curve.setPen(color=new_color)
+            self.curve.setPen(color=self.color)
             if self.label:
-                self.label.update_color(new_color)
+                self.label.update_color(self.color)
+            if self.value_label:
+                self.value_label.setColor(self.color)
 
     def _show_marker(self, show = True):
         if show:
@@ -186,7 +190,7 @@ class SeriesState:
         self.curve = PlotDataItem(pen=pg.mkPen(color=self.color), paint=None)
         self.vb.addItem(self.curve)
 
-        self.label = DraggableLabelItem(text=self.column_name, color=self.color, anchor=(-0.1, 0.5), ss=self, viewer=self.viewer)
+        self.label = DraggableLabelItem(text=self.display_name, color=self.color, anchor=(-0.1, 0.5), ss=self, viewer=self.viewer)
         self.vb.addItem(self.label, ignoreBounds=True)
 
         self.value_label = pg.TextItem("", color=self.color, anchor=(-0.1, 0.5))
@@ -646,7 +650,13 @@ class CSVPlotViewer(QMainWindow):
             self.statusBar().showMessage("Checking for updates...")
             QApplication.processEvents()
 
-            with urllib.request.urlopen(update_url, timeout=15) as response:
+            req_url = f"{update_url}?t={int(time.time())}"
+            req = urllib.request.Request(req_url, headers={
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            })
+            with urllib.request.urlopen(req, timeout=15) as response:
                 if response.getcode() != 200:
                     raise Exception(f"Failed to download. Status code: {response.getcode()}")
 
@@ -895,11 +905,11 @@ class CSVPlotViewer(QMainWindow):
                 continue
 
             ss: SeriesState = child_item.data()
-
-            if ss.column_name in signallist:
-                new_text = ss.column_name + ": " + signallist[ss.column_name]
-                child_item.setText(new_text)
-                ss.label.update_text(new_text)
+            if ss and ss.column_name in signallist:
+                ss.display_name = ss.column_name + ": " + signallist[ss.column_name]
+                child_item.setText(ss.display_name)
+                if ss.label:
+                    ss.label.update_text(ss.display_name)
 
     def _populate_tree(self, file_path, df):
         filename = os.path.basename(file_path)

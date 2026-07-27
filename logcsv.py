@@ -18,6 +18,7 @@ import re
 import json
 import sqlite3
 import lzma
+import urllib.request
 import time
 import csv
 import io
@@ -2866,7 +2867,13 @@ def show_window(files: list):
                 self.statusBar().showMessage("Checking for updates...")
                 QApplication.processEvents()
     
-                with urllib.request.urlopen(update_url, timeout=15) as response:
+                req_url = f"{update_url}?t={int(time.time())}"
+                req = urllib.request.Request(req_url, headers={
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'Pragma': 'no-cache',
+                    'Expires': '0'
+                })
+                with urllib.request.urlopen(req, timeout=15) as response:
                     if response.getcode() != 200:
                         raise Exception(f"Failed to download. Status code: {response.getcode()}")
                     
