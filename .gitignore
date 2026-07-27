@@ -5,9 +5,13 @@ logs/
 _old/
 _power-analysis/
 _analysis/
+docs/
 *.db-shm
 *.db-wal
 *.xz
 *.zip
 *.log
 *.pyz
+*.csv
+*.zst
+schema*.txt
