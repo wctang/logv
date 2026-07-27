@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260717"
+VERSION = "20260727"
 
 
 class SeriesState:
