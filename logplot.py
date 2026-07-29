@@ -28,12 +28,12 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QDoubleSpinBox, QPushButton, QLabel, QLineEdit, QMessageBox,
     QTableWidget, QTableWidgetItem, QHBoxLayout, QInputDialog
 )
-from PySide6.QtGui import QAction, QStandardItemModel, QStandardItem, QColor, QBrush, QActionGroup
+from PySide6.QtGui import QAction, QStandardItemModel, QStandardItem, QColor, QBrush, QActionGroup, QCursor
 from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260727"
+VERSION = "20260729"
 
 
 class SeriesState:
@@ -256,12 +256,29 @@ class DraggableLabelItem(pg.TextItem):
     def __init__(self, text, color, anchor, ss: SeriesState):
         super().__init__(anchor=anchor)
         self.ss: SeriesState = ss
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
         self.is_dragging = False
         self.drag_mode = None # 'offset' or 'scale'
         self.initial_mouse_y = 0
         self.initial_offset = 0
         self.initial_scale = 1.0
         self.update_text(text, color)
+
+    def _open_context_menu(self):
+        view = self.getViewWidget()
+        win = view.window() if view else None
+        if not win and self.scene() and self.scene().views():
+            win = self.scene().views()[0].window()
+        if win and hasattr(win, 'show_series_context_menu'):
+            win.show_series_context_menu(self.ss.column_item, QCursor.pos())
+
+    def contextMenuEvent(self, ev):
+        ev.accept()
+        self._open_context_menu()
+
+    def raiseContextMenu(self, ev):
+        ev.accept()
+        self._open_context_menu()
 
     def update_text(self, text, color):
         self.setText(text, color=color)
@@ -295,8 +312,15 @@ class DraggableLabelItem(pg.TextItem):
             view_pos = vb.mapSceneToView(ev.scenePos())
             self.initial_mouse_y = view_pos.y()
             self.initial_offset, self.initial_scale = self.ss.adjustment
+        elif ev.button() == Qt.RightButton:
+            ev.accept()
         else:
             ev.ignore()
+
+    def mouseClickEvent(self, ev):
+        if ev.button() == Qt.RightButton:
+            ev.accept()
+            self._open_context_menu()
 
     def mouseMoveEvent(self, ev):
         if self.is_dragging:
@@ -1027,61 +1051,7 @@ class CSVPlotViewer(QMainWindow):
             ss.update_label_position()
 
 
-    def show_context_menu(self, position):
-        index = self.tree_view.indexAt(position)
-        menu = QMenu()
-
-        if index.isValid():
-            item = self.model.itemFromIndex(index)
-            if item.parent() is None:
-                # clear_file_selections_action = QAction("Clear All Selections", self)
-                # clear_file_selections_action.triggered.connect(
-                #     lambda checked=False, file_item=item: self.clear_all_selections_for_file(file_item)
-                # )
-                # menu.addAction(clear_file_selections_action)
-
-                load_signal_action = QAction("Load SignalList Files", self)
-                load_signal_action.triggered.connect(
-                    lambda checked=False, file_item=item: self.select_signallist_for_file(file_item)
-                )
-                menu.addAction(load_signal_action)
-
-                remove_file_action = QAction("Remove File", self)
-                remove_file_action.triggered.connect(
-                    lambda checked=False, file_item=item: self.remove_file(file_item)
-                )
-                menu.addAction(remove_file_action)
-            else:
-                if item.column() != 0 and item.parent():
-                    item = item.parent().child(item.row(), 0)
-
-                rename_action = QAction("Rename Series", self)
-                rename_action.triggered.connect(lambda: self.rename_series(item))
-                menu.addAction(rename_action)
-
-                change_color_action = QAction("Change Color", self)
-                change_color_action.triggered.connect(lambda: self.change_column_color(item))
-                menu.addAction(change_color_action)
-                adjust_curve_action = QAction("Adjust Y Position and Scale", self)
-                adjust_curve_action.triggered.connect(lambda: self.adjust_curve_position_scale(item))
-                menu.addAction(adjust_curve_action)
-
-                menu.addSeparator()
-
-                diff1_action = QAction("1st Derivative", self)
-                diff1_action.triggered.connect(lambda: self.create_computed_series(item, 1))
-                menu.addAction(diff1_action)
-
-                diff2_action = QAction("2nd Derivative", self)
-                diff2_action.triggered.connect(lambda: self.create_computed_series(item, 2))
-                menu.addAction(diff2_action)
-
-                abs_action = QAction("Absolute Value", self)
-                abs_action.triggered.connect(lambda: self.create_computed_series(item, "abs"))
-                menu.addAction(abs_action)
-
-            menu.addSeparator()
-
+    def _add_common_tree_actions(self, menu):
         expand_all_action = QAction("Expand All", self)
         expand_all_action.triggered.connect(self.tree_view.expandAll)
         menu.addAction(expand_all_action)
@@ -1106,7 +1076,77 @@ class CSVPlotViewer(QMainWindow):
         remove_all_action.triggered.connect(self.remove_all_files)
         menu.addAction(remove_all_action)
 
-        menu.exec(self.tree_view.viewport().mapToGlobal(position))
+    def show_series_context_menu(self, item, global_pos):
+        if item is None:
+            return
+        if item.column() != 0 and item.parent():
+            item = item.parent().child(item.row(), 0)
+
+        menu = QMenu(self)
+
+        rename_action = QAction("Rename Series", self)
+        rename_action.triggered.connect(lambda: self.rename_series(item))
+        menu.addAction(rename_action)
+
+        change_color_action = QAction("Change Color", self)
+        change_color_action.triggered.connect(lambda: self.change_column_color(item))
+        menu.addAction(change_color_action)
+
+        adjust_curve_action = QAction("Adjust Y Position and Scale", self)
+        adjust_curve_action.triggered.connect(lambda: self.adjust_curve_position_scale(item))
+        menu.addAction(adjust_curve_action)
+
+        menu.addSeparator()
+
+        diff1_action = QAction("1st Derivative", self)
+        diff1_action.triggered.connect(lambda: self.create_computed_series(item, 1))
+        menu.addAction(diff1_action)
+
+        diff2_action = QAction("2nd Derivative", self)
+        diff2_action.triggered.connect(lambda: self.create_computed_series(item, 2))
+        menu.addAction(diff2_action)
+
+        abs_action = QAction("Absolute Value", self)
+        abs_action.triggered.connect(lambda: self.create_computed_series(item, "abs"))
+        menu.addAction(abs_action)
+
+        menu.addSeparator()
+
+        self._add_common_tree_actions(menu)
+
+        menu.exec(global_pos)
+
+    def show_context_menu(self, position):
+        index = self.tree_view.indexAt(position)
+        global_pos = self.tree_view.viewport().mapToGlobal(position)
+
+        if index.isValid():
+            item = self.model.itemFromIndex(index)
+            if item.parent() is not None:
+                self.show_series_context_menu(item, global_pos)
+                return
+
+            menu = QMenu(self)
+
+            load_signal_action = QAction("Load SignalList Files", self)
+            load_signal_action.triggered.connect(
+                lambda checked=False, file_item=item: self.select_signallist_for_file(file_item)
+            )
+            menu.addAction(load_signal_action)
+
+            remove_file_action = QAction("Remove File", self)
+            remove_file_action.triggered.connect(
+                lambda checked=False, file_item=item: self.remove_file(file_item)
+            )
+            menu.addAction(remove_file_action)
+
+            menu.addSeparator()
+        else:
+            menu = QMenu(self)
+
+        self._add_common_tree_actions(menu)
+
+        menu.exec(global_pos)
 
     def set_filtered_items_check_state(self, state):
         for row in range(self.model.rowCount()):
