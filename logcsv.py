@@ -25,7 +25,7 @@ import io
 import pandas as pd
 import zstandard as zstd
 
-VERSION = "20260721"
+VERSION = "20260817"
 
 class SchemaErrorException(Exception):
     pass
