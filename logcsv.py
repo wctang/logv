@@ -25,7 +25,7 @@ import io
 import pandas as pd
 import zstandard as zstd
 
-VERSION = "20260817"
+VERSION = "20260827"
 
 class SchemaErrorException(Exception):
     pass
@@ -742,6 +742,8 @@ def prepare_process_rules(pathpre):
     # 北京 v-ride
     # id:101,num:1,conn:0,en:0,st:stop,		rio:[sb:0],[(null):0],[(null):0],[(null):0],		sb_auto:0,mp_auto:1,		sb_cnt:6,sb:[0,0,0,0,0,0],		sb_b_lock:1,sb_b_unlock:0,		sb_guardrail_lock_1:0,sb_guardrail_lock_2:0,sb_air_pressure:0,		sfx:[mist_moto:0,mist_en:0,scent1:0,2:0,3:0,led:0,wind:0]
     # id:1,DI_PLAY:[0:0],					STOP:0,RESET:0,					OP_MODE:[0:0],					DI_PN_E_STOP:0,					POWER1_NORMAL:0,UPS1_NORMAL:0,					EQ:0,FIRE:0,					EMS:0,DO_PLAY_LED:0,					DO_READY_LED:1,HEART_BEAT:1,					ALL_LIGHT_ON:0,					BG1_STO_SAFE:0,BG1_DRIVER:0,					BG1_E_STOP:[0:0],					BG1_UP:[0:0],					BG1_DOWN:[0:0],					BG1_CW:0,BG1_CCW:0,					BG1_UP_ACC:0,BG1_DOWN_ACC:0,					BG1_DOOR_OPEN:[0:0],					BG1_DOOR_CLOSE:[0:0],					BG1_AUTO:0,					BG1_DOOR_CTRL:[0:0],					BG1_DOOR_LOCK:[0:0],					BG1_DOOR_E_STOP:[1:1],					BG1_RAISE:0,BG1_FALL:0,					BG1_HIGH_SP:0,BG1_LOW_SP:0,					BG2_STO_SAFE:0, BG2_DRIVER:0,					BG2_E_STOP:[0:0],					BG2_UP:[0:0],					BG2_DOWN:[0:0],					BG2_CW:0,BG2_CCW:0,					BG2_UP_ACC:0,BG2_DOWN_ACC:0,					BG2_DOOR_OPEN:[0:0],					BG2_DOOR_CLOSE:[0:0],					BG2_AUTO:0,					BG2_DOOR_CTRL:[0:0],					BG2_DOOR_LOCK:[0:0],					BG2_DOOR_E_STOP:[1:1],					BG2_RAISE:0,BG2_FALL:0,					BG2_HIGH_SP:0,BG2_LOW_SP:0
+    # 貴州
+    # id:101,num:1,fid:0,conn:0,en:0,st:stop,drt:0,               rio:[gt:0],[sb:0],[ca:0],[es:0],                gt_safe_st:0,gt_safe_err:0,gt_temp:0,gt_auto:0,gt_up_high:0,gt_down_hign:0,gt_up_cmd:0,gt_down_cmd:0,gt_up:[o:0|i:0,0],gt_down:[o:0|i:0,0],                ca_safe_st:0,ca_safe_err:0,ca_temp:0,ca_auto:0,ca_f_high:0,ca_b_hign:0,ca_f_cmd:0,ca_b_cmd:0,ca_forward:[o:0|i:0,0],ca_backward:[o:0|i:0,0],               cl_lock:[0,0],cl_up:[lock:0,0|unlock:0,0],cl_down:[lock:0,0|unlock:0,0],           sb_cnt:10,sb:[0,0,0,0,0,0,0,0,0,0],             sb_b_lock:0,sb_r_lock:0,                sfx:[mist_moto:0,mist_en:0,scent1:0,2:0,3:0,led:0,wind:0]
 
     def xinjiang_io_handler():
         fname = 'di'
@@ -758,6 +760,7 @@ def prepare_process_rules(pathpre):
         PTN6 = re.compile(r'^id:(\d+),DI_PLAY:\[(\d):(\d)\],STOP:(\d),RESET:(\d),OP_MODE:\[(\d):(\d)\],\s+PN1_READY:\[(\d):(\d)\],PN2_READY:\[(\d):(\d)\],PN3_READY:\[(\d):(\d)\],PN_ENABLE:\[(\d):(\d):(\d)\],\s+POWER1_NORMAL:(\d),UPS1_NORMAL:(\d),1F:\[(\d):(\d)\],2F:\[(\d):(\d)\],\s+3F:\[(\d):(\d)\],EQ:(\d),FIRE:(\d),EMS:(\d),POWER2_NORMAL:(\d),UPS2_NORMAL:(\d),DO_PLAY_LED:(\d),DO_READY_LED:(\d),PN1_READY:\[(\d):(\d)\],PN2_READY:\[(\d):(\d)\],\s+PN3_READY:\[(\d):(\d)\],PN_AVAILABLE:\[(\d):(\d):(\d)\],1F_LIGHT_ON:(\d),2F_LIGHT_ON:(\d),3F_LIGHT_ON:(\d),HEART_BEAT:(\d)$')
         PTN7 = re.compile(r'^id:(\d+),num:(\d+),conn:(\d+),en:(\d+),st:([\w\s]+?),\s+rio:\[sb:(\d)\],\[\(null\):(\d)\],\[\(null\):(\d)\],\[\(null\):(\d)\],\s+sb_auto:(\d),mp_auto:(\d),\s+sb_cnt:(\d+),sb:\[(\d),(\d),(\d),(\d),(\d),(\d)\],\s+sb_b_lock:(\d),sb_b_unlock:(\d),\s+sb_guardrail_lock_1:(\d),sb_guardrail_lock_2:(\d),sb_air_pressure:(\d),\s+sfx:\[mist_moto:(\d),mist_en:(\d),scent1:(\d),2:(\d),3:(\d),led:(\d+),wind:(\d+)\]$')
         PTN8 = re.compile(r'^id:(\d+),DI_PLAY:\[(\d):(\d)\],\s+STOP:(\d),RESET:(\d),\s+OP_MODE:\[(\d):(\d)\],\s+DI_PN_E_STOP:(\d),\s+POWER1_NORMAL:(\d),UPS1_NORMAL:(\d),\s+EQ:(\d),FIRE:(\d),\s+EMS:(\d),DO_PLAY_LED:(\d),\s+DO_READY_LED:(\d),HEART_BEAT:(\d),\s+ALL_LIGHT_ON:(\d),\s+BG1_STO_SAFE:(\d),BG1_DRIVER:(\d),\s+BG1_E_STOP:\[(\d):(\d)\],\s+BG1_UP:\[(\d):(\d)\],\s+BG1_DOWN:\[(\d):(\d)\],\s+BG1_CW:(\d),BG1_CCW:(\d),\s+BG1_UP_ACC:(\d),BG1_DOWN_ACC:(\d),\s+BG1_DOOR_OPEN:\[(\d):(\d)\],\s+BG1_DOOR_CLOSE:\[(\d):(\d)\],\s+BG1_AUTO:(\d),\s+BG1_DOOR_CTRL:\[(\d):(\d)\],\s+BG1_DOOR_LOCK:\[(\d):(\d)\],\s+BG1_DOOR_E_STOP:\[(\d):(\d)\],\s+BG1_RAISE:(\d),BG1_FALL:(\d),\s+BG1_HIGH_SP:(\d),BG1_LOW_SP:(\d),\s+BG2_STO_SAFE:(\d),\s+BG2_DRIVER:(\d),\s+BG2_E_STOP:\[(\d):(\d)\],\s+BG2_UP:\[(\d):(\d)\],\s+BG2_DOWN:\[(\d):(\d)\],\s+BG2_CW:(\d),BG2_CCW:(\d),\s+BG2_UP_ACC:(\d),BG2_DOWN_ACC:(\d),\s+BG2_DOOR_OPEN:\[(\d):(\d)\],\s+BG2_DOOR_CLOSE:\[(\d):(\d)\],\s+BG2_AUTO:(\d),\s+BG2_DOOR_CTRL:\[(\d):(\d)\],\s+BG2_DOOR_LOCK:\[(\d):(\d)\],\s+BG2_DOOR_E_STOP:\[(\d):(\d)\],\s+BG2_RAISE:(\d),BG2_FALL:(\d),\s+BG2_HIGH_SP:(\d),BG2_LOW_SP:(\d)$')
+        PTN9 = re.compile(r'^id:(\d+),num:(\d+),fid:(\d+),conn:(\d+),en:(\d+),st:([\w\s]+?),drt:(\d+),\s+rio:\[gt:(\d)\],\[sb:(\d)\],\[ca:(\d)\],\[es:(\d)\],\s+gt_safe_st:(\d),gt_safe_err:(\d),gt_temp:(\d),gt_auto:(\d),gt_up_high:(\d),gt_down_hign:(\d),gt_up_cmd:(\d),gt_down_cmd:(\d),gt_up:\[o:(\d)\|i:(\d),(\d)\],gt_down:\[o:(\d)\|i:(\d),(\d)\],\s+ca_safe_st:(\d),ca_safe_err:(\d),ca_temp:(\d),ca_auto:(\d),ca_f_high:(\d),ca_b_hign:(\d),ca_f_cmd:(\d),ca_b_cmd:(\d),ca_forward:\[o:(\d)\|i:(\d),(\d)\],ca_backward:\[o:(\d)\|i:(\d),(\d)\],\s+cl_lock:\[(\d),(\d)\],cl_up:\[lock:(\d),(\d)\|unlock:(\d),(\d)\],cl_down:\[lock:(\d),(\d)\|unlock:(\d),(\d)\],\s+sb_cnt:(\d+),sb:\[(\d),(\d),(\d),(\d),(\d),(\d),(\d),(\d),(\d),(\d)\],\s+sb_b_lock:(\d),sb_r_lock:(\d),\s+sfx:\[mist_moto:(\d),mist_en:(\d),scent1:(\d),2:(\d),3:(\d),led:(\d+),wind:(\d+)\]$')
 
         def process_log(ts, src, msg):
             # return False
@@ -800,6 +803,10 @@ def prepare_process_rules(pathpre):
                 # print(m, msg)
                 if m[1] not in head:
                     head[m[1]] = ["datetime","DI_PLAY1","DI_PLAY2","STOP","RESET","OP_MODE1","OP_MODE2","DI_PN_E_STOP","POWER1_NORMAL","UPS1_NORMAL","EQ","FIRE","EMS","DO_PLAY_LED","DO_READY_LED","HEART_BEAT","ALL_LIGHT_ON","BG1_STO_SAFE","BG1_DRIVER","BG1_E_STOP1","BG1_E_STOP2","BG1_UP1","BG1_UP2","BG1_DOWN1","BG1_DOWN2","BG1_CW","BG1_CCW","BG1_UP_ACC","BG1_DOWN_ACC","BG1_DOOR_OPEN1","BG1_DOOR_OPEN2","BG1_DOOR_CLOSE1","BG1_DOOR_CLOSE2","BG1_AUTO","BG1_DOOR_CTRL1","BG1_DOOR_CTRL2","BG1_DOOR_LOCK1","BG1_DOOR_LOCK2","BG1_DOOR_E_STOP1","BG1_DOOR_E_STOP2","BG1_RAISE","BG1_FALL","BG1_HIGH_SP","BG1_LOW_SP","BG2_STO_SAFE","BG2_DRIVER","BG2_E_STOP1","BG2_E_STOP2","BG2_UP1","BG2_UP2","BG2_DOWN1","BG2_DOWN2","BG2_CW","BG2_CCW","BG2_UP_ACC","BG2_DOWN_ACC","BG2_DOOR_OPEN1","BG2_DOOR_OPEN2","BG2_DOOR_CLOSE1","BG2_DOOR_CLOSE2","BG2_AUTO","BG2_DOOR_CTRL1","BG2_DOOR_CTRL2","BG2_DOOR_LOCK1","BG2_DOOR_LOCK2","BG2_DOOR_E_STOP1","BG2_DOOR_E_STOP2","BG2_RAISE","BG2_FALL","BG2_HIGH_SP","BG2_LOW_SP"]
+            elif (m := PTN9.match(msg)):
+                # print(m, msg)
+                if m[1] not in head:
+                    head[m[1]] = ["datetime","num","fid","conn","en","st","drt","rio_gt","rio_sb","rio_ca","rio_es","gt_safe_st","gt_safe_err","gt_temp","gt_auto","gt_up_high","gt_down_hign","gt_up_cmd","gt_down_cmd","gt_up_o1","gt_up1","gt_up2","gt_down_o1","gt_down1","gt_down2","ca_safe_st","ca_safe_err","ca_temp","ca_auto","ca_f_high","ca_b_hign","ca_f_cmd","ca_b_cmd","ca_forward_o1","ca_forward1","ca_forward2","ca_backward_o1","ca_backward1","ca_backward2","cl_lock1","cl_lock2","cl_up_lock1","cl_up_lock2","cl_up_unlock1","cl_up_unlock2","cl_down_lock1","cl_down_lock2","cl_down_unlock1","cl_down_unlock2","sb_cnt","sb1","sb2","sb3","sb4","sb5","sb6","sb7","sb8","sb9","sb10","sb_b_lock","sb_r_lock","sfx_mist_moto","sfx_mist_en","sfx_scent1","sfx_scent2","sfx_scent3","sfx_led","sfx_wind"]
             else:
                 raise ValueError(msg)
 
