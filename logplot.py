@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260729"
+VERSION = "20260901"
 
 
 class SeriesState:
@@ -389,6 +389,8 @@ class CSVPlotViewer(QMainWindow):
 
         # 初始化搜索功能相關變數
         self.search_results = []
+        self.raw_search_matches = []
+        self.pinned_results = {} # (file_path, timestamp, series) -> dict of pinned info
         self.current_search_index = -1
 
         self._init_ui()
@@ -501,16 +503,16 @@ class CSVPlotViewer(QMainWindow):
         self.search_prev_button = QPushButton("上一筆 (Shift+F3)")
         self.search_next_button = QPushButton("下一筆 (F3)")
         self.search_status_label = QLabel("")
+        self.search_status_label.setMinimumWidth(80)
 
         self.search_prev_button.clicked.connect(self.find_previous_result)
         self.search_next_button.clicked.connect(self.find_next_result)
 
         self.search_layout.addWidget(QLabel("全局搜索:"))
-        self.search_layout.addWidget(self.search_input)
+        self.search_layout.addWidget(self.search_input, 1)
         self.search_layout.addWidget(self.search_prev_button)
         self.search_layout.addWidget(self.search_next_button)
         self.search_layout.addWidget(self.search_status_label)
-        self.search_layout.addStretch()
 
         self.bottom_layout.addWidget(self.search_widget)
 
@@ -521,7 +523,14 @@ class CSVPlotViewer(QMainWindow):
         self.text_data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.text_data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.text_data_table.horizontalHeader().setStretchLastSection(True)
+        self.text_data_table.setColumnWidth(0, 180)
+        self.text_data_table.setColumnWidth(1, 150)
+        self.text_data_table.setColumnWidth(2, 150)
+        self.text_data_table.setMouseTracking(True)
+        self.text_data_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.text_data_table.customContextMenuRequested.connect(self.show_table_context_menu)
         self.text_data_table.itemDoubleClicked.connect(self.jump_to_result_from_double_click)
+        self.text_data_table.cellEntered.connect(self.jump_to_result_from_hover)
         self.bottom_layout.addWidget(self.text_data_table)
         self.bottom_widget.setVisible(False) # 初始時隱藏整個下半部
 
@@ -1072,6 +1081,13 @@ class CSVPlotViewer(QMainWindow):
 
         menu.addSeparator()
 
+        clear_marks_action = QAction("Clear All Markers (清除所有標記)", self)
+        clear_marks_action.triggered.connect(self.clear_all_pinned_results)
+        clear_marks_action.setEnabled(bool(self.pinned_results))
+        menu.addAction(clear_marks_action)
+
+        menu.addSeparator()
+
         remove_all_action = QAction("Remove All Files", self)
         remove_all_action.triggered.connect(self.remove_all_files)
         menu.addAction(remove_all_action)
@@ -1187,6 +1203,16 @@ class CSVPlotViewer(QMainWindow):
         # 3. 清理已勾選的文字序列
         series_to_remove = {s for s in self.active_text_series if s[0] == file_path}
         self.active_text_series -= series_to_remove
+
+        # 清理該檔案相關的標記
+        keys_to_remove = [k for k in self.pinned_results if k[0] == file_path]
+        for k in keys_to_remove:
+            info = self.pinned_results.pop(k)
+            if info.get('line'):
+                try:
+                    self.mouse_vb.removeItem(info['line'])
+                except Exception:
+                    pass
 
         # 4. 移除 DataFrame
         self.dataframes.pop(file_path, None)
@@ -1332,7 +1358,7 @@ class CSVPlotViewer(QMainWindow):
         self.update_label_positions()
 
     def mouse_moved(self, pos):
-        if self.keyboard_mode or self.in_search_mode:
+        if self.keyboard_mode:
             return
 
         if self.mouse_vb.sceneBoundingRect().contains(pos):
@@ -1388,38 +1414,9 @@ class CSVPlotViewer(QMainWindow):
                         except (TypeError, ValueError):
                             value_item.setText(str(value))
 
-        # 如果不在搜索模式，則更新表格為實時數據
+        # 如果不在搜索模式，更新表格中的即時數據（保留置頂標記項目，重設即時數據顏色）
         if not self.in_search_mode:
-            tz = timezone(timedelta(seconds=-self.x_axis.utcOffset))
-
-            display_data = []
-            for key in self.active_text_series:
-                ss = self.series.get(key)
-                if not ss:
-                    continue
-                res = ss.search_by_timestamp(self.current_timestamp)
-                if res is None:
-                    continue
-                value, _, closest_timestamp = res
-                if isinstance(value, str) and value:
-                    ts_str = datetime.fromtimestamp(closest_timestamp / 1e9, tz=tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    display_data.append((ts_str, os.path.basename(ss.filepath), ss.display_name, value))
-
-            self.text_data_table.setRowCount(len(display_data))
-
-            for row_idx, row_data in enumerate(display_data):
-                for col_idx, text in enumerate(row_data):
-                    item = self.text_data_table.item(row_idx, col_idx)
-                    if item is None:
-                        self.text_data_table.setItem(row_idx, col_idx, QTableWidgetItem(text))
-                    else:
-                        item.setText(text)
-
-            if display_data:
-                self.text_data_table.resizeColumnsToContents()
-                self.text_data_table.horizontalHeader().setStretchLastSection(True)
-
-            self.bottom_widget.setVisible(bool(display_data))
+            self._populate_table()
 
         # 顯示數值標籤
         for ss in self.series.values():
@@ -1597,27 +1594,161 @@ class CSVPlotViewer(QMainWindow):
         self.measure_text1.setPos(pos1, y_min)
         self.measure_text2.setPos(pos2, y_min)
 
-    # --- 全局搜索功能方法 ---
+    # --- 全局搜索與表格功能方法 ---
+
+    def _populate_table(self):
+        """填充/刷新文字數據表格（支援搜索模式與即時數據模式，始終置頂顯示已標記項目並正確還原/設定顏色）。"""
+        tz = timezone(timedelta(seconds=-self.x_axis.utcOffset))
+        pinned_list = sorted(self.pinned_results.values(), key=lambda x: x['timestamp'])
+
+        rows_data = []
+
+        # 1. 置頂項目（帶有自訂標記顏色）
+        for p in pinned_list:
+            ts_str = datetime.fromtimestamp(p['timestamp'] / 1e9, tz=tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            filename = os.path.basename(p['file'])
+            rows_data.append({
+                'ts_str': ts_str,
+                'file': filename,
+                'filepath': p['file'],
+                'series': p['series'],
+                'value': p['value'],
+                'pinned': True,
+                'color': p['color'],
+                'timestamp': p['timestamp']
+            })
+
+        if self.in_search_mode:
+            # 2a. 搜索模式：加入搜索匹配項目（未置頂項目，使用預設顏色）
+            pinned_keys = set(self.pinned_results.keys())
+            for item in self.raw_search_matches:
+                key = (item['file'], item['timestamp'], item['series'])
+                if key not in pinned_keys:
+                    ts_str = datetime.fromtimestamp(item['timestamp'] / 1e9, tz=tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    filename = os.path.basename(item['file'])
+                    rows_data.append({
+                        'ts_str': ts_str,
+                        'file': filename,
+                        'filepath': item['file'],
+                        'series': item['series'],
+                        'value': item['value'],
+                        'pinned': False,
+                        'color': None,
+                        'timestamp': item['timestamp']
+                    })
+        else:
+            # 2b. 非搜索模式：加入當前時間點的實時文字數據（未置頂項目，還原預設顏色）
+            if self.current_timestamp is not None:
+                for key in self.active_text_series:
+                    ss = self.series.get(key)
+                    if not ss:
+                        continue
+                    res = ss.search_by_timestamp(self.current_timestamp)
+                    if res is None:
+                        continue
+                    value, _, closest_timestamp = res
+                    if isinstance(value, str) and value:
+                        ts_str = datetime.fromtimestamp(closest_timestamp / 1e9, tz=tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                        rows_data.append({
+                            'ts_str': ts_str,
+                            'file': os.path.basename(ss.filepath),
+                            'filepath': ss.filepath,
+                            'series': ss.display_name,
+                            'value': value,
+                            'pinned': False,
+                            'color': None,
+                            'timestamp': closest_timestamp
+                        })
+
+        self.search_results = rows_data
+        self.text_data_table.setRowCount(len(rows_data))
+
+        default_brush = QBrush()
+
+        for row_idx, r in enumerate(rows_data):
+            col_texts = [r['ts_str'], r['file'], r['series'], r['value']]
+            is_pinned = r['pinned']
+            color = r['color']
+
+            if is_pinned and color:
+                bg_color = QColor(color.red(), color.green(), color.blue(), 70)
+                bg_brush = QBrush(bg_color)
+                fg_brush = QBrush(color.lighter(130) if color.value() < 180 else color)
+            else:
+                bg_brush = default_brush
+                fg_brush = default_brush
+
+            for col_idx, text in enumerate(col_texts):
+                item = self.text_data_table.item(row_idx, col_idx)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    self.text_data_table.setItem(row_idx, col_idx, item)
+                else:
+                    item.setText(text)
+
+                item.setBackground(bg_brush)
+                item.setForeground(fg_brush)
+
+        self.bottom_widget.setVisible(bool(rows_data))
+
+    def clear_all_pinned_results(self):
+        """清除所有標記與置頂垂線。"""
+        for pinned_info in self.pinned_results.values():
+            if pinned_info.get('line'):
+                try:
+                    self.mouse_vb.removeItem(pinned_info['line'])
+                except Exception:
+                    pass
+        self.pinned_results.clear()
+
+        self._populate_table()
+        if self.in_search_mode and self.search_results:
+            self.jump_to_result(0, scroll_table=True)
+
+    def show_table_context_menu(self, position):
+        """顯示搜尋表格的右鍵選單。"""
+        menu = QMenu(self)
+
+        item = self.text_data_table.itemAt(position)
+        if item is not None:
+            row = item.row()
+            if 0 <= row < len(self.search_results):
+                result = self.search_results[row]
+                key = (result['filepath'], result['timestamp'], result['series'])
+                if key in self.pinned_results:
+                    toggle_action = QAction("取消標記 (雙擊)", self)
+                else:
+                    toggle_action = QAction("標記 / 置頂垂線 (雙擊)", self)
+                toggle_action.triggered.connect(lambda checked=False, it=item: self.jump_to_result_from_double_click(it))
+                menu.addAction(toggle_action)
+                menu.addSeparator()
+
+        clear_action = QAction("清除所有標記", self)
+        clear_action.triggered.connect(self.clear_all_pinned_results)
+        clear_action.setEnabled(bool(self.pinned_results))
+        menu.addAction(clear_action)
+
+        menu.exec(self.text_data_table.viewport().mapToGlobal(position))
 
     def clear_search_if_empty(self, text):
-        """如果搜索框被清空，則退出搜索模式。"""
+        """如果搜索框被清空，則退出搜索模式（保留標記的置頂項目與垂線，還原即時文字數據及顏色）。"""
         if not text:
             self.in_search_mode = False
-            self.search_results.clear()
+            self.raw_search_matches.clear()
             self.current_search_index = -1
             self.search_status_label.setText("")
-            # 刷新表格以顯示實時數據
+            self._populate_table()
             self.update_crosshair(self.current_timestamp)
 
     def search_global_text(self):
-        """在所有 active_text_series 中搜索文字。"""
+        """在所有 active_text_series 中搜索文字（保留已標記置頂的結果）。"""
         search_text = self.search_input.text()
         if not search_text:
             self.clear_search_if_empty("")
             return
 
         self.in_search_mode = True
-        self.search_results.clear()
+        self.raw_search_matches.clear()
         self.current_search_index = -1
 
         found_items = []
@@ -1644,38 +1775,13 @@ class CSVPlotViewer(QMainWindow):
                     'value': value
                 })
 
-        # 按時間戳排序結果
-        self.search_results = sorted(found_items, key=lambda x: x['timestamp'])
-        self._populate_table_from_search_results()
+        self.raw_search_matches = sorted(found_items, key=lambda x: x['timestamp'])
+        self._populate_table()
 
         if self.search_results:
             self.jump_to_result(0)
         else:
             self.search_status_label.setText("未找到結果")
-
-    def _populate_table_from_search_results(self):
-        """用搜索結果填充表格。"""
-        self.text_data_table.setRowCount(0)
-        if not self.search_results:
-            # self.bottom_widget.setVisible(False)
-            return
-
-        self.bottom_widget.setVisible(True)
-        self.text_data_table.setRowCount(len(self.search_results))
-        tz = timezone(timedelta(seconds=-self.x_axis.utcOffset))
-
-        for row, result in enumerate(self.search_results):
-            ts_str = datetime.fromtimestamp(result['timestamp'] / 1e9, tz=tz).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            filename = os.path.basename(result['file'])
-
-            self.text_data_table.setItem(row, 0, QTableWidgetItem(ts_str))
-            self.text_data_table.setItem(row, 1, QTableWidgetItem(filename))
-            self.text_data_table.setItem(row, 2, QTableWidgetItem(result['series']))
-            self.text_data_table.setItem(row, 3, QTableWidgetItem(result['value']))
-
-        self.text_data_table.resizeColumnsToContents()
-        self.text_data_table.horizontalHeader().setStretchLastSection(True)
-
 
     def find_next_result(self):
         """跳轉到下一個搜索結果。"""
@@ -1693,13 +1799,64 @@ class CSVPlotViewer(QMainWindow):
         prev_index = (self.current_search_index - 1 + len(self.search_results)) % len(self.search_results)
         self.jump_to_result(prev_index)
 
-    def jump_to_result_from_double_click(self, item):
-        """處理表格中的雙擊事件，跳轉到對應的搜索結果。"""
-        if not self.in_search_mode or item is None:
+    def jump_to_result_from_hover(self, row, column):
+        """處理表格中的滑鼠懸停事件，跳轉到對應的搜索/置頂結果。"""
+        if row == self.current_search_index:
             return
-        self.jump_to_result(item.row())
+        if not (0 <= row < len(self.search_results)):
+            return
+        self.jump_to_result(row, scroll_table=False)
 
-    def jump_to_result(self, index):
+    def jump_to_result_from_double_click(self, item):
+        """處理表格中的雙擊事件：切換置頂狀態、隨機顏色與圖表標記垂線。"""
+        if item is None:
+            return
+
+        row = item.row()
+        if not (0 <= row < len(self.search_results)):
+            return
+
+        result = self.search_results[row]
+        key = (result['filepath'], result['timestamp'], result['series'])
+
+        if key in self.pinned_results:
+            pinned_info = self.pinned_results.pop(key)
+            if pinned_info.get('line'):
+                try:
+                    self.mouse_vb.removeItem(pinned_info['line'])
+                except Exception:
+                    pass
+        else:
+            h = random.randint(0, 359)
+            s = random.randint(160, 255)
+            v = random.randint(200, 255)
+            color = QColor.fromHsv(h, s, v)
+
+            pen = pg.mkPen(color, width=1.5, style=Qt.DashLine)
+            line = pg.InfiniteLine(pos=result['timestamp'] / 1e9, angle=90, movable=False, pen=pen)
+            self.mouse_vb.addItem(line, ignoreBounds=True)
+
+            self.pinned_results[key] = {
+                'timestamp': result['timestamp'],
+                'file': result['filepath'],
+                'series': result['series'],
+                'value': result['value'],
+                'color': color,
+                'line': line,
+            }
+
+        self._populate_table()
+
+        target_index = 0
+        for idx, res in enumerate(self.search_results):
+            if (res['filepath'], res['timestamp'], res['series']) == key:
+                target_index = idx
+                break
+
+        if self.search_results:
+            self.jump_to_result(target_index, scroll_table=True)
+
+    def jump_to_result(self, index, scroll_table=True):
         """將圖表和表格跳轉到指定的結果索引。"""
         if not (0 <= index < len(self.search_results)):
             return
@@ -1707,16 +1864,20 @@ class CSVPlotViewer(QMainWindow):
         self.current_search_index = index
         result = self.search_results[index]
 
-        # 更新狀態標籤
-        self.search_status_label.setText(f"結果: {index + 1}/{len(self.search_results)}")
+        # 更新狀態標籤（僅在搜尋模式下顯示幾分之幾）
+        if self.in_search_mode:
+            self.search_status_label.setText(f"結果: {index + 1}/{len(self.search_results)}")
 
         # 將圖表光標移動到結果的時間戳
         self.update_crosshair(result['timestamp'])
 
         # 滾動表格、選取該行並設置焦點
-        self.text_data_table.scrollToItem(self.text_data_table.item(index, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
+        if scroll_table:
+            item = self.text_data_table.item(index, 0)
+            if item:
+                self.text_data_table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self.text_data_table.setFocus()
         self.text_data_table.selectRow(index)
-        self.text_data_table.setFocus()
 
 
 
