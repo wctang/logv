@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260901"
+VERSION = "20260903"
 
 
 class SeriesState:
@@ -532,10 +532,10 @@ class CSVPlotViewer(QMainWindow):
         self.text_data_table.itemDoubleClicked.connect(self.jump_to_result_from_double_click)
         self.text_data_table.cellEntered.connect(self.jump_to_result_from_hover)
         self.bottom_layout.addWidget(self.text_data_table)
-        self.bottom_widget.setVisible(False) # 初始時隱藏整個下半部
+        self.bottom_widget.setVisible(True) # 初始時預設顯示下半部
 
-        # 調整分割器比例
-        self.main_splitter.setSizes([700, 300])
+        # 調整分割器比例 (縮小下方訊息視窗預設高度)
+        self.main_splitter.setSizes([850, 150])
 
         # Measurement mode
         pen = pg.mkPen('y', style=Qt.DashLine)
@@ -597,6 +597,40 @@ class CSVPlotViewer(QMainWindow):
         load_state_action.triggered.connect(self.load_state)
         file_menu.addAction(load_state_action)
 
+        mode_menu = menubar.addMenu("Mode")
+
+        self.keyboard_mode_action = QAction("Keyboard Navigation Mode (Space)", self)
+        self.keyboard_mode_action.setCheckable(True)
+        self.keyboard_mode_action.setChecked(self.keyboard_mode)
+        self.keyboard_mode_action.triggered.connect(self.toggle_keyboard_mode)
+        mode_menu.addAction(self.keyboard_mode_action)
+
+        self.measure_mode_action = QAction("Measurement Mode (F2)", self)
+        self.measure_mode_action.setCheckable(True)
+        self.measure_mode_action.setChecked(self.measure_mode)
+        self.measure_mode_action.triggered.connect(self.toggle_measure_mode)
+        mode_menu.addAction(self.measure_mode_action)
+
+        self.show_values_action = QAction("Show Curve Values (S)", self)
+        self.show_values_action.setCheckable(True)
+        self.show_values_action.setChecked(self.show_values_mode)
+        self.show_values_action.triggered.connect(self.toggle_show_values)
+        mode_menu.addAction(self.show_values_action)
+
+        self.show_markers_action = QAction("Show Data Markers (M)", self)
+        self.show_markers_action.setCheckable(True)
+        self.show_markers_action.setChecked(self.show_markers)
+        self.show_markers_action.triggered.connect(self.toggle_show_markers)
+        mode_menu.addAction(self.show_markers_action)
+
+        mode_menu.addSeparator()
+
+        self.bottom_panel_action = QAction("Show Bottom Panel (F4)", self)
+        self.bottom_panel_action.setCheckable(True)
+        self.bottom_panel_action.setChecked(not self.bottom_widget.isHidden())
+        self.bottom_panel_action.triggered.connect(self.toggle_bottom_widget)
+        mode_menu.addAction(self.bottom_panel_action)
+
         tz_menu = menubar.addMenu("Timezone")
         tz_group = QActionGroup(self)
         for i in range(12):
@@ -654,6 +688,7 @@ class CSVPlotViewer(QMainWindow):
     <li><b>F2:</b> 切換測量模式。出現兩條垂直線以測量時間差。</li>
     <li><b>F3:</b> 尋找下一個搜尋結果。</li>
     <li><b>Shift+F3:</b> 尋找上一個搜尋結果。</li>
+    <li><b>F4:</b> 切換顯示/隱藏下方訊息視窗。</li>
     <li><b>M:</b> 切換顯示曲線的資料點標記 (Marker)。</li>
     <li><b>S:</b> 切換顯示曲線數值，在滑鼠線上和各線段交點處顯示標註數值。</li>
 </ul>
@@ -1367,8 +1402,6 @@ class CSVPlotViewer(QMainWindow):
 
     def update_crosshair(self, timestamp):
         if timestamp is None:
-            if not self.in_search_mode:
-                self.bottom_widget.setVisible(False)
             for ss in self.series.values():
                 if ss.value_label:
                     ss.value_label.setVisible(False)
@@ -1497,6 +1530,11 @@ class CSVPlotViewer(QMainWindow):
             event.accept()
             return
 
+        if event.key() == Qt.Key_F4:
+            self.toggle_bottom_widget()
+            event.accept()
+            return
+
         if event.key() == Qt.Key_F1:
             self.show_usage_dialog()
             event.accept()
@@ -1508,22 +1546,17 @@ class CSVPlotViewer(QMainWindow):
             return
 
         if event.key() == Qt.Key_Space:
-            self.keyboard_mode = not self.keyboard_mode
+            self.toggle_keyboard_mode()
             event.accept()
             return
 
         if event.key() == Qt.Key_M:
-            self.show_markers = not self.show_markers
-            for ss in self.series.values():
-                if not ss.is_active:
-                    continue
-                ss.show_marker(self.show_markers)
+            self.toggle_show_markers()
             event.accept()
             return
 
         if event.key() == Qt.Key_S:
-            self.show_values_mode = not self.show_values_mode
-            self.update_crosshair(self.current_timestamp)
+            self.toggle_show_values()
             event.accept()
             return
 
@@ -1549,8 +1582,56 @@ class CSVPlotViewer(QMainWindow):
             event.accept()
             return
 
-    def toggle_measure_mode(self):
-        self.measure_mode = not self.measure_mode
+    def toggle_keyboard_mode(self, checked=None):
+        if checked is None:
+            self.keyboard_mode = not self.keyboard_mode
+        else:
+            self.keyboard_mode = bool(checked)
+        if hasattr(self, 'keyboard_mode_action'):
+            self.keyboard_mode_action.setChecked(self.keyboard_mode)
+
+    def toggle_show_markers(self, checked=None):
+        if checked is None:
+            self.show_markers = not self.show_markers
+        else:
+            self.show_markers = bool(checked)
+        if hasattr(self, 'show_markers_action'):
+            self.show_markers_action.setChecked(self.show_markers)
+        for ss in self.series.values():
+            if not ss.is_active:
+                continue
+            ss.show_marker(self.show_markers)
+
+    def toggle_show_values(self, checked=None):
+        if checked is None:
+            self.show_values_mode = not self.show_values_mode
+        else:
+            self.show_values_mode = bool(checked)
+        if hasattr(self, 'show_values_action'):
+            self.show_values_action.setChecked(self.show_values_mode)
+        self.update_crosshair(self.current_timestamp)
+
+    def toggle_bottom_widget(self, checked=None):
+        if checked is None:
+            is_visible = self.bottom_widget.isHidden()
+        else:
+            is_visible = bool(checked)
+        self.bottom_widget.setVisible(is_visible)
+        if hasattr(self, 'bottom_panel_action'):
+            self.bottom_panel_action.setChecked(is_visible)
+        if is_visible:
+            sizes = self.main_splitter.sizes()
+            if len(sizes) >= 2 and sizes[1] == 0:
+                total = sum(sizes)
+                self.main_splitter.setSizes([int(total * 0.85), int(total * 0.15)])
+
+    def toggle_measure_mode(self, checked=None):
+        if checked is None:
+            self.measure_mode = not self.measure_mode
+        else:
+            self.measure_mode = bool(checked)
+        if hasattr(self, 'measure_mode_action'):
+            self.measure_mode_action.setChecked(self.measure_mode)
 
         self.measure_line1.setVisible(self.measure_mode)
         self.measure_line2.setVisible(self.measure_mode)
@@ -1688,8 +1769,6 @@ class CSVPlotViewer(QMainWindow):
 
                 item.setBackground(bg_brush)
                 item.setForeground(fg_brush)
-
-        self.bottom_widget.setVisible(bool(rows_data))
 
     def clear_all_pinned_results(self):
         """清除所有標記與置頂垂線。"""
