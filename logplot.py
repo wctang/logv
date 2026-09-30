@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260903"
+VERSION = "20260930"
 
 
 class SeriesState:
@@ -377,6 +377,7 @@ class CSVPlotViewer(QMainWindow):
         self.current_timestamp = None
         self.keyboard_mode = False
         self.measure_mode = False
+        self.measure_highlight_mode = False  # True when 'f' highlights changed series
         self.show_markers = False
         self.show_values_mode = True
         self.in_search_mode = False # 新增：用於區分表格顯示模式
@@ -686,6 +687,7 @@ class CSVPlotViewer(QMainWindow):
     <li><b>左右方向鍵:</b> 移動十字線到上一個/下一個資料點。</li>
     <li><b>F1:</b> 顯示此說明視窗。</li>
     <li><b>F2:</b> 切換測量模式。出現兩條垂直線以測量時間差。</li>
+    <li><b>F (測量模式中):</b> 搜尋所有已載入序列，在兩條測量線的時間範圍內數值有變化的序列會在右側面板中高亮顯示。再次按 F 取消高亮。</li>
     <li><b>F3:</b> 尋找下一個搜尋結果。</li>
     <li><b>Shift+F3:</b> 尋找上一個搜尋結果。</li>
     <li><b>F4:</b> 切換顯示/隱藏下方訊息視窗。</li>
@@ -1560,6 +1562,11 @@ class CSVPlotViewer(QMainWindow):
             event.accept()
             return
 
+        if event.key() == Qt.Key_F and self.measure_mode:
+            self.toggle_measure_highlight()
+            event.accept()
+            return
+
         if (self.keyboard_mode or self.in_search_mode) and self.dataframes and (event.key() == Qt.Key_Left or event.key() == Qt.Key_Right):
             first_file = next(iter(self.dataframes))
             df = self.dataframes[first_file]
@@ -1625,6 +1632,64 @@ class CSVPlotViewer(QMainWindow):
                 total = sum(sizes)
                 self.main_splitter.setSizes([int(total * 0.85), int(total * 0.15)])
 
+    def toggle_measure_highlight(self):
+        """Toggle highlight of series that changed value between the two measure lines."""
+        if self.measure_highlight_mode:
+            self._clear_highlight_changed_series()
+            self.measure_highlight_mode = False
+            self.statusBar().clearMessage()
+        else:
+            self.measure_highlight_mode = True
+            self._highlight_changed_series()
+
+    def _highlight_changed_series(self):
+        """Scan all loaded series; highlight those whose value changed between measure line 1 and line 2."""
+        t1_s = self.measure_line1.value()  # seconds (float)
+        t2_s = self.measure_line2.value()
+        t1_ns = int(min(t1_s, t2_s) * 1e9)
+        t2_ns = int(max(t1_s, t2_s) * 1e9)
+
+        changed_count = 0
+        highlight_bg = QColor(255, 200, 0, 50)   # amber tint
+        highlight_fg = QColor(255, 220, 60)       # bright amber text
+        highlight_bg_brush = QBrush(highlight_bg)
+        highlight_fg_brush = QBrush(highlight_fg)
+
+        for key, ss in self.series.items():
+            res1 = ss.search_by_timestamp(t1_ns)
+            res2 = ss.search_by_timestamp(t2_ns)
+
+            changed = False
+            if res1 is not None and res2 is not None:
+                v1, nv1, _ = res1
+                v2, nv2, _ = res2
+                try:
+                    if isinstance(v1, float) and isinstance(v2, float):
+                        changed = not (np.isnan(v1) and np.isnan(v2)) and v1 != v2
+                    else:
+                        changed = str(v1) != str(v2)
+                except Exception:
+                    changed = False
+
+            if changed:
+                ss.column_item.setBackground(highlight_bg_brush)
+                ss.column_item.setForeground(highlight_fg_brush)
+                changed_count += 1
+            else:
+                # Ensure non-changed rows are cleared (restore series colour)
+                ss.column_item.setBackground(QBrush())
+                ss.column_item.setForeground(QBrush(ss.color))
+
+        self.statusBar().showMessage(
+            f"[Measure highlight] {changed_count} series changed between the two lines. Press 'f' to cancel."
+        )
+
+    def _clear_highlight_changed_series(self):
+        """Remove measure-highlight colouring from all series items."""
+        for ss in self.series.values():
+            ss.column_item.setBackground(QBrush())
+            ss.column_item.setForeground(QBrush(ss.color))
+
     def toggle_measure_mode(self, checked=None):
         if checked is None:
             self.measure_mode = not self.measure_mode
@@ -1638,6 +1703,12 @@ class CSVPlotViewer(QMainWindow):
         self.measure_label.setVisible(self.measure_mode)
         self.measure_text1.setVisible(self.measure_mode)
         self.measure_text2.setVisible(self.measure_mode)
+
+        # Cancel highlight mode when leaving measure mode
+        if not self.measure_mode and self.measure_highlight_mode:
+            self._clear_highlight_changed_series()
+            self.measure_highlight_mode = False
+            self.statusBar().clearMessage()
 
         if self.measure_mode:
             x_min, x_max = self.main_vb.viewRange()[0]
