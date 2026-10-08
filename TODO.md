@@ -30,18 +30,18 @@
 
 ```mermaid
 flowchart LR
-  OMP["omp<br/>mcp__logplot_*"] -->|"POST /mcp (HTTP)"| SRV["McpHttpServer :2260<br/>daemon thread"]
-  SRV -->|"bridge.call_requested<br/>Signal(object), queued"| BR["McpBridge :2147<br/>GUI thread slot"]
+  OMP["omp<br/>mcp__logplot_*"] -->|"POST /mcp (HTTP)"| SRV["McpHttpServer :2605<br/>daemon thread"]
+  SRV -->|"bridge.call_requested<br/>Signal(object), queued"| BR["McpBridge :2209<br/>GUI thread slot"]
   BR --> TOOLS["tools dict<br/>(name → fn)"]
   TOOLS --> APP["CSVPlotViewer<br/>series / model / ViewBox / dataframes"]
   BR -.->|"job.event.set()"| SRV
 ```
 
-- 常數：`logplot.py:43-56`（`MCP_DEFAULT_PORT=8790`、`MCP_CALL_TIMEOUT=60.0`、`MCP_DISCOVERY_PATH`、`MCP_INSTRUCTIONS`）。放在 `VERSION` 之後是必要的——預設參數在 class 定義時求值。
-- `CSVPlotViewer.start_mcp_server()` :2068 / `stop_mcp_server()` / `closeEvent()` 負責生命週期。
-- `main()` :2409 解析 `--mcp-port` / `--mcp-token`，在 `window.show()` 後啟動。
+- 常數：分類門檻 `logplot.py:47-48`、MCP 預設 `:53-59`。放在 `VERSION` 之後是必要的——`--mcp-port` 的預設參數在 class 定義時求值。
+- `SeriesState.kind` :119（快取的分類）、`_json_value` :2182 與 `_segment_starts` :2191（時間視窗表示法）、`McpBridge` :2209 / `McpHttpServer` :2605。
+- `CSVPlotViewer.start_mcp_server()` :2103 負責生命週期，`main()` :2754 解析 `--mcp-port` / `--mcp-token`，在 `window.show()` 後啟動。
 
-## 已實作（Phase 1）
+## 已實作
 
 | 項目 | 實作 |
 |---|---|
@@ -70,6 +70,10 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - 協定層：401（無 token）、initialize / ping / tools/list / tools/call、未知方法 `-32601`、壞 JSON 400 `-32700`、`GET /mcp` 405、`closeEvent` 後埠停止並刪除探索檔 —— 全部對部署環境 `D:\log_tools\runtime\python.exe` (3.13.3) 實測。
 - 端到端：`OMP_MCP_REQUIRE_READY=1 omp -p --no-session --mode json "…"` → omp 在 discovery 階段連上，工具以 `mcp__logplot_load_files` 掛載（`details.xdev.inner.serverName == "logplot"`），回傳的是執行中 GUI 的真實狀態。
 - 真實資料：`log-20260101.log_mpc_ctrl_105.csv.zst` → 328,746 列 × 125 欄，2025-12-31 23:00:03 ~ 2026-01-01 20:29:03 (UTC+8)。
+- 分類（`kind`）：邊界逐一驗證 —— 字串 14 → `enum`、15 → `text`；數值 2 → `enum`、3 → `analog`；全 NaN → `enum`。8 個 fixture 勾選後的實際落點（`second_vb` / `main_vb` / 不畫）與 `kind` 全部相符，字串 `enum` 才建立 `text_mapping`。真實 125 欄檔案 `kinds` 分佈 enum 73 / analog 51 / text 1，與另一支獨立量測的 distinct 計數一致。
+- Phase 2 時間視窗：26 列的 fixture 逐項驗證 —— 階梯訊號的變化清單 `[[t0,0],[t0+3,1],[t0+7,2]]`、單樣本/空視窗/不落在樣本上的視窗、全空白欄回 `[[t0, null]]`、物件欄的連續空白收斂成一段、`max_points` 觸發 `dense`、字串 `dense` 的值分佈含空白且正確截斷、`find_changes` 的逐欄次數（含 `limit` 截斷）與四種參數錯誤訊息。所有 payload 都用**拒絕 `NaN`/`Infinity` 的嚴格 JSON parser** 解析過。
+- Phase 2 真實檔案交叉比對：`find_changes` 全檔（328,746 樣本 × 125 欄）**729 ms / 10.5 KB**、1 小時 **37 ms**；`unchanged_series = 34` 與獨立量測一致，`alarm_data` 47、`mpc_ctrl_t_play` 280,140、`t_elapsed` 280,140、`pos_1` 257,490、`mpc_ctrl_mode` 333、`st_1` 922 全部吻合。`get_window` 1 小時：`mpc_ctrl_mode` 18 段 / 0.82 KB / 1.9 ms、`mpc_ctrl_cali_1` 1 段、`alarm_data` 1 段（整小時空白）、`t_elapsed` 走 `dense`（15,074 段略去，0.50 KB）。
+- 這輪在真實資料上抓到兩個 fixture 沒涵蓋的缺陷：物件欄的 NaN 被當成「每樣本都變」（`alarm_data` 誤報 324,428 次，實際 47 次）、以及 `to_numpy()` 把 4,100 萬個元素裝箱成 object 陣列導致全檔掃描要 2.7 s（改為逐欄 `shift()` 比較後 0.73 s）。
 - Phase 2 工具：`list_files` / `list_series` 以四種檔案寫法（完整路徑 / basename / 反斜線 / 全小寫）呼叫皆命中；未知檔回錯誤並列出已載入檔案；400 欄不截斷、500 欄截斷成 400 並標 `truncated`；`plotted` / `labels` / `text_tracked` 以臨時腳本驅動真實 `CSVPlotViewer` 驗證（數值曲線、2 值的分類字串、20 值的字串只追蹤不繪圖、改名後的 label、空欄位省略）。
 
 ## 工具清單（每項對應既有 method）
@@ -78,9 +82,9 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 |---|---|---|
 | `load_files(paths)` | `load_csv_files`（:927） | ✅ Phase 1 |
 | `list_files()` | `dataframes` → 逐檔 rows / columns / start / end | ✅ Phase 2 |
-| `list_series(file?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels`（不回數值） | ✅ Phase 2 |
-| `get_value(file, col, t)` | `SeriesState.search_by_timestamp`（:169，秒或 ns、`searchsorted` O(log n)） | Phase 2 |
-| `get_window(file, col, t1, t2, max_points)` | `df.loc[t1_ns:t2_ns]`，**必須在此層聚合 / 下採樣後才回傳** | Phase 2 |
+| `list_series(file?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels` / `kinds`（不回數值） | ✅ Phase 2 |
+| `find_changes(t1, t2, file?)` | 逐欄 `shift()` 比較，回有變化的訊號與次數（忙的在前）；篩選層 | ✅ Phase 2 |
+| `get_window(file, column, t1, t2, max_points?)` | 變化清單（精確 RLE），超出預算則轉 `dense` 摘要 | ✅ Phase 2 |
 | `search_text(q)` | `search_input.setText` + `search_global_text()`（:1923） | Phase 2 |
 | `get_view_range` | `main_vb.viewRange()` | Phase 2 |
 | `plot_series` / `unplot_series` | `column_item.setCheckState()` → `on_item_changed`（:1056） | Phase 3 |
@@ -97,10 +101,16 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - 訊號識別一律用 `column`，值取自 `list_series` 的 `numeric_series` / `string_series`。
 - `list_series` 每檔上限 `MCP_MAX_SERIES_PER_FILE`（400）個名稱，超過時 `truncated: true` 並附 `series_count`；空欄位（`text_tracked` / `labels`）直接省略。
 - 時間一律 Unix 秒（UTC, float）。
+- `kinds` 是 viewer 自己的繪圖分類，由 `SeriesState.kind` 單一來源計算並記憶：`enum`（右軸車道，distinct 少）／`analog`（主軸）／`text`（自由文字，只追蹤不畫）。門檻為 `STRING_TEXT_THRESHOLD`(15) 與 `NUMERIC_ENUM_THRESHOLD`(3)，兩個數值不再內嵌於勾選路徑。
+- 注意：`list_series` 第一次讀一檔會替每欄做一次全欄 distinct 計數（125 欄實測約 0.5 s，在 GUI thread），之後由 `SeriesState` 快取（1.4 ms）。勾選路徑因此不再重算。
+- **時間視窗的表示法（`find_changes` / `get_window` 共用）**：變化清單 `segments: [[t, value], …]`，值的有效範圍**到下一段為止**（最後一段到 `t2`），頭尾相連故不重複 `t_end`。區間是雙端閉區間；`t ≥ 1e11` 沿用 `search_by_timestamp` 的規則視為 ns。
+- **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。
+- `get_window` 的 `mode`：`segments`（段數 ≤ `max_points`，零資訊損失）／`dense`（超預算，改回 `stats` + `extremes`，字串欄改回值的分佈含空白）。`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)。
+- **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_segment_starts()` 用 `pd.isna` 做這個遮罩；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
 
 ## 待辦
 
-- [ ] **Phase 2 — 唯讀工具**（`list_files` / `list_series` 已完成）：`get_value` / `get_window` / `search_text` / `get_view_range`
+- [ ] **Phase 2 — 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window` 已完成）：`search_text` / `get_view_range`
 - [ ] **Phase 3 — UI 操作工具**：`plot_series` / `unplot_series` / `zoom_to` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`
 
 每階段可獨立 smoke test，不必等全鏈路完成。

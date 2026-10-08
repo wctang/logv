@@ -39,20 +39,33 @@ from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
 VERSION = "20260930"
 
+# How a series is drawn, decided by counting the distinct values of its whole column
+# (see SeriesState.kind). A string column with >= STRING_TEXT_THRESHOLD distinct values is
+# free text: tracked for the value table and search, never plotted. Anything with fewer
+# distinct values, and any numeric column below NUMERIC_ENUM_THRESHOLD distinct values, is
+# an enum and gets its own lane on the right axis. The rest is analog, on the main axis.
+STRING_TEXT_THRESHOLD = 15
+NUMERIC_ENUM_THRESHOLD = 3
+
 # MCP server defaults (see the MCP section at the bottom of this file).
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PORT = 8790
 MCP_CALL_TIMEOUT = 60.0
 MCP_MAX_SERIES_PER_FILE = 400  # cap on names list_series returns per file
+MCP_MAX_WINDOW_POINTS = 500    # default segment budget for get_window
+MCP_WINDOW_POINT_CAP = 5000    # hard cap on that budget
+MCP_MAX_CHANGED_SERIES = 500   # default cap on find_changes rows
+MCP_MAX_DISTINCT_VALUES = 20   # cap on the value distribution of a dense string window
 MCP_DISCOVERY_PATH = os.path.join(tempfile.gettempdir(), "logplot-mcp.json")
 
 MCP_INSTRUCTIONS = (
     "logplot is a GUI log viewer running on this machine; the human user sees every "
     "change immediately. All timestamps are Unix seconds (UTC, float) with microsecond "
     "resolution available. Only the listed tools exist -- there is no shell, no file "
-    "write and no way to remove data. Windowed queries return aggregated or "
-    "down-sampled data, never raw million-row series."
+    "write and no way to remove data. A time window is answered with the signal's change "
+    "list when that fits, otherwise with a bounded summary; a raw million-row series is "
+    "never returned."
 )
 
 
@@ -65,6 +78,8 @@ class SeriesState:
         self.timestamps = timestamps
         self.series_data = series_data
         self.series_data_mapping = None
+        self._kind = None                   # memoised by the kind / distinct_count properties
+        self._distinct = None
 
         self.display_name = self.column_name
         self.has_marker = False
@@ -99,6 +114,32 @@ class SeriesState:
         if type(self.series_data) == np.ndarray:
             return False
         return self.series_data.dtype in ['object', 'str']
+
+    @property
+    def kind(self):
+        """How the viewer draws this series: "text" (tracked only), "enum" (a lane on the
+        right axis) or "analog" (main axis). Memoised: the column never changes after load."""
+        if self._kind is None:
+            self._kind, self._distinct = self._classify()
+        return self._kind
+
+    @property
+    def distinct_count(self):
+        """Number of distinct values in the column, as used by kind."""
+        if self._kind is None:
+            self._kind, self._distinct = self._classify()
+        return self._distinct
+
+    def _classify(self):
+        """Count distinct values over the whole column and turn that into a kind."""
+        column = self.df[self.column_name]
+        if self.is_string_type:
+            distinct = len(column.dropna().unique())
+            return ("text" if distinct >= STRING_TEXT_THRESHOLD else "enum"), distinct
+
+        values = column.to_numpy(dtype=float)
+        distinct = len(np.unique(values[~np.isnan(values)]))
+        return ("enum" if distinct < NUMERIC_ENUM_THRESHOLD else "analog"), distinct
 
     def set_color(self, new_color):
         self.color = new_color
@@ -1059,23 +1100,24 @@ class CSVPlotViewer(QMainWindow):
             return
 
         ss: SeriesState = item.data()
-        df = self.dataframes[ss.filepath]
         key = (ss.filepath, ss.column_name)
 
         if item.checkState() == Qt.Checked:
             if ss.is_active:
                 return
 
-            if ss.is_string_type:
-                # 檢查獨立字串數量，如果小於15，則當作分類數據繪圖
-                unique_vals = df[ss.column_name].dropna().unique()
-                if len(unique_vals) >= 15:
-                    self.active_text_series.add(key)
-                    self.update_crosshair(self.current_timestamp) # Refresh table for live mode
-                    return
+            kind = ss.kind
 
-                # 建立字串到整數的映射
-                ss.text_mapping()
+            if kind == "text":
+                # 太多獨立字串，無法當分類數據繪圖：只追蹤供下方表格與搜尋使用
+                self.active_text_series.add(key)
+                self.update_crosshair(self.current_timestamp) # Refresh table for live mode
+                return
+
+            if kind == "enum":
+                if ss.is_string_type:
+                    # 建立字串到整數的映射
+                    ss.text_mapping()
 
                 # 為新的分類曲線計算一個不重疊的 Y 軸偏移
                 if ss.adjustment == (0.0, 1.0):
@@ -1083,15 +1125,7 @@ class CSVPlotViewer(QMainWindow):
 
                 vb = self.second_vb   # 在右邊的 ViewBox 繪製
             else:
-                values = df[ss.column_name].to_numpy(dtype=float)
-                unique_vals = np.unique(values[~np.isnan(values)])
-                if len(unique_vals) < 3:
-                    if ss.adjustment == (0.0, 1.0):
-                        ss.adjustment = self._find_none_overlap_offset()
-
-                    vb = self.second_vb
-                else:
-                    vb = self.main_vb
+                vb = self.main_vb
 
             # 建立曲線
             ss._create_curve(vb)
@@ -2145,6 +2179,33 @@ class _McpJob:
         self.error = None
 
 
+def _json_value(value):
+    """numpy scalar -> plain Python; NaN -> None so the payload stays valid JSON."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and value != value:
+        return None
+    return value
+
+
+def _segment_starts(values):
+    """Positions where a sample differs from the previous one; NaN vs NaN counts as unchanged.
+
+    The first sample always starts a segment, so len(result) - 1 is the number of changes.
+    A run of blanks (NaN in an object column, or in a numeric one) is one segment, not many.
+    """
+    if len(values) == 0:
+        return np.empty(0, dtype=int)
+    current, previous = values[1:], values[:-1]
+    both_blank = pd.isna(current) & pd.isna(previous)
+    if values.dtype.kind in "OUS":
+        same = both_blank | (current == previous)
+    else:
+        numbers = values.astype(float)
+        same = both_blank | (numbers[1:] == numbers[:-1])
+    return np.flatnonzero(np.concatenate(([True], ~same)))
+
+
 class McpBridge(QObject):
     """Owns the tool table and runs every tool on the GUI thread."""
 
@@ -2223,9 +2284,11 @@ class McpBridge(QObject):
         )
         self._add_tool(
             "list_series",
-            "List the signal names available in the loaded files, split into numeric_series "
-            "and string_series, plus which ones are currently plotted. These names are what "
-            "the other tools take as 'column'.",
+            "List the signal names available in the loaded files, split into numeric_series and "
+            "string_series, plus which ones are currently plotted. Each name also has a 'kind' "
+            "describing how the viewer draws it: 'analog' (main axis), 'enum' (a lane on the "
+            "right axis, few distinct values) or 'text' (free text: tracked and searchable but "
+            "never plotted). These names are what the other tools take as 'column'.",
             {
                 "type": "object",
                 "properties": {
@@ -2238,6 +2301,48 @@ class McpBridge(QObject):
                 "additionalProperties": False,
             },
             self._tool_list_series,
+        )
+        self._add_tool(
+            "find_changes",
+            "Screen which signals changed inside a time window: one row per signal that moved, "
+            "with how many times it changed, busiest first. Use it before reading any signal in "
+            "detail. Signal names are what get_window takes as 'column'.",
+            {
+                "type": "object",
+                "properties": {
+                    "t1": {"type": "number", "description": "Window start, Unix seconds."},
+                    "t2": {"type": "number", "description": "Window end, Unix seconds (inclusive)."},
+                    "file": {"type": "string",
+                             "description": "Limit to one loaded file (see list_files). Omit for all."},
+                    "limit": {"type": "integer",
+                              "description": f"Max rows to return, default {MCP_MAX_CHANGED_SERIES}."},
+                },
+                "required": ["t1", "t2"],
+                "additionalProperties": False,
+            },
+            self._tool_find_changes,
+        )
+        self._add_tool(
+            "get_window",
+            "Read one signal over a time window as its change list: segments of [time, value] "
+            "where the value holds until the next segment (the last holds until t2). Exact and "
+            "complete when the signal has few changes; if it exceeds max_points the reply turns "
+            "into a bounded summary (mode 'dense') instead.",
+            {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Loaded file (see list_files)."},
+                    "column": {"type": "string", "description": "Signal name (see list_series)."},
+                    "t1": {"type": "number", "description": "Window start, Unix seconds."},
+                    "t2": {"type": "number", "description": "Window end, Unix seconds (inclusive)."},
+                    "max_points": {"type": "integer",
+                                   "description": f"Segment budget, default {MCP_MAX_WINDOW_POINTS}, "
+                                                  f"max {MCP_WINDOW_POINT_CAP}."},
+                },
+                "required": ["file", "column", "t1", "t2"],
+                "additionalProperties": False,
+            },
+            self._tool_get_window,
         )
 
     # --- tools ---
@@ -2315,7 +2420,7 @@ class McpBridge(QObject):
         files = []
         for path in targets:
             df = self.viewer.dataframes[path]
-            numeric, strings, plotted, tracked, labels = [], [], [], [], {}
+            numeric, strings, plotted, tracked, labels, kinds = [], [], [], [], {}, {}
             truncated = False
 
             for col in df.columns:
@@ -2330,6 +2435,7 @@ class McpBridge(QObject):
                     numeric.append(name)
                 if ss is None:
                     continue
+                kinds[name] = ss.kind          # how the viewer draws it
                 if ss.is_active:
                     plotted.append(name)
                 if (path, col) in self.viewer.active_text_series:
@@ -2349,8 +2455,146 @@ class McpBridge(QObject):
                 entry["text_tracked"] = tracked
             if labels:
                 entry["labels"] = labels
+            if kinds:
+                entry["kinds"] = kinds
             files.append(entry)
         return {"files": files}
+
+    # --- time windows ---
+    # One representation for both tools: a change list, [time, value] pairs where the value
+    # holds until the next pair (the last one holds until t2). It is exact when the signal
+    # has few changes, which is most of them; the rest fall back to a bounded summary.
+
+    @staticmethod
+    def _to_ns(t):
+        """Unix seconds -> ns. Values >= 1e11 are taken as ns, like search_by_timestamp."""
+        return int(t) if t >= 1e11 else int(t * 1e9)
+
+    @staticmethod
+    def _window_args(args):
+        t1, t2 = args.get("t1"), args.get("t2")
+        for name, value in (("t1", t1), ("t2", t2)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"'{name}' must be a number (Unix seconds)")
+        if t1 > t2:
+            raise ValueError(f"t1 ({t1}) must be <= t2 ({t2})")
+        return float(t1), float(t2)
+
+    @staticmethod
+    def _positive_int(value, name, cap=None):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 1:
+            raise ValueError(f"'{name}' must be a positive integer")
+        value = int(value)
+        return value if cap is None else min(value, cap)
+
+    def _window_slice(self, df, t1, t2):
+        """Row positions of the closed interval [t1, t2], as a half-open [start, stop)."""
+        index = df.index
+        return (int(index.searchsorted(self._to_ns(t1), side="left")),
+                int(index.searchsorted(self._to_ns(t2), side="right")))
+
+    def _tool_find_changes(self, args):
+        t1, t2 = self._window_args(args)
+        requested = args.get("file")
+        targets = [self._resolve_file(requested)] if requested else list(self.viewer.dataframes)
+        limit = self._positive_int(args.get("limit", MCP_MAX_CHANGED_SERIES), "limit")
+
+        files, moved, unchanged = [], [], 0
+        for path in targets:
+            df = self.viewer.dataframes[path]
+            start, stop = self._window_slice(df, t1, t2)
+            window = df.iloc[start:stop]
+            files.append({"file": path, "samples": int(len(window))})
+
+            if len(window) < 2:
+                unchanged += int(df.shape[1])
+                continue
+
+            # Per-column comparison keeps each column in its native dtype; going through
+            # to_numpy() here would box 40M+ elements into one object array.
+            # NaN vs NaN did not change; everything else compares by value.
+            shifted = window.shift()
+            changed = ~(window.eq(shifted) | (window.isna() & shifted.isna()))
+            changed.iloc[0] = False             # nothing precedes the first sample
+            for col, count in zip(df.columns, changed.sum().to_numpy()):
+                count = int(count)
+                if count == 0:
+                    unchanged += 1
+                    continue
+                ss = self.viewer.series.get((path, col))
+                moved.append({"file": path, "column": str(col),
+                              "kind": ss.kind if ss is not None else "analog",
+                              "changed": count})
+
+        moved.sort(key=lambda row: -row["changed"])
+        return {"t1": t1, "t2": t2, "files": files,
+                "changed_series": len(moved), "unchanged_series": unchanged,
+                "truncated": len(moved) > limit, "series": moved[:limit]}
+
+    def _tool_get_window(self, args):
+        path = self._resolve_file(args.get("file"))
+        column = args.get("column")
+        if not isinstance(column, str) or not column:
+            raise ValueError("'column' must be a non-empty string")
+        t1, t2 = self._window_args(args)
+        max_points = self._positive_int(args.get("max_points", MCP_MAX_WINDOW_POINTS),
+                                        "max_points", MCP_WINDOW_POINT_CAP)
+
+        df = self.viewer.dataframes[path]
+        if column not in df.columns:
+            raise ValueError(f"unknown column {column!r}; call list_series(file='{path}') for the names")
+
+        start, stop = self._window_slice(df, t1, t2)
+        index = df.index.to_numpy()[start:stop]
+        values = df[column].to_numpy()[start:stop]
+        ss = self.viewer.series.get((path, column))
+
+        out = {"file": path, "column": column,
+               "kind": ss.kind if ss is not None else "analog",
+               "t1": t1, "t2": t2, "samples": int(len(values))}
+        if len(values) == 0:
+            out["mode"] = "segments"
+            out["segments"] = []
+            return out
+
+        out["sample_start"] = float(index[0]) / 1e9
+        out["sample_end"] = float(index[-1]) / 1e9
+
+        starts = _segment_starts(values)
+        if len(starts) <= max_points:
+            out["mode"] = "segments"
+            out["segments"] = [[float(index[i]) / 1e9, _json_value(values[i])] for i in starts]
+            return out
+
+        # The signal changes on most samples: summarise instead of listing it.
+        out["mode"] = "dense"
+        out["segments_omitted"] = int(len(starts))
+        out["changed_samples"] = int(len(starts) - 1)   # one change per segment boundary
+
+        if values.dtype.kind in "OUS":
+            counts = pd.Series(values).value_counts(dropna=False)   # blanks are a value too
+            head = counts.iloc[:MCP_MAX_DISTINCT_VALUES]
+            out["distinct"] = int(len(counts))
+            out["values"] = {str(k): int(v) for k, v in head.items()}
+            out["values_truncated"] = bool(len(counts) > len(head))
+        else:
+            numbers = values.astype(float)
+            good = numbers[~np.isnan(numbers)]
+            if len(good) == 0:
+                out["stats"] = None
+            else:
+                lo, hi = int(np.nanargmin(numbers)), int(np.nanargmax(numbers))
+                out["stats"] = {
+                    "min": float(good.min()), "max": float(good.max()),
+                    "mean": float(good.mean()), "std": float(good.std()),
+                    "first": _json_value(values[0]), "last": _json_value(values[-1]),
+                    "nan": int(len(numbers) - len(good)),
+                }
+                out["extremes"] = {
+                    "min": [float(index[lo]) / 1e9, float(numbers[lo])],
+                    "max": [float(index[hi]) / 1e9, float(numbers[hi])],
+                }
+        return out
 
 
 class _McpHTTPServer(ThreadingHTTPServer):
