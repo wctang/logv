@@ -17,7 +17,11 @@ import os
 import json
 import time
 import re
+import tempfile
+import threading
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 from argparse import ArgumentParser
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -29,11 +33,27 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHBoxLayout, QInputDialog
 )
 from PySide6.QtGui import QAction, QStandardItemModel, QStandardItem, QColor, QBrush, QActionGroup, QCursor
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, Signal
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
 VERSION = "20260930"
+
+# MCP server defaults (see the MCP section at the bottom of this file).
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+MCP_DEFAULT_PORT = 8790
+MCP_CALL_TIMEOUT = 60.0
+MCP_MAX_SERIES_PER_FILE = 400  # cap on names list_series returns per file
+MCP_DISCOVERY_PATH = os.path.join(tempfile.gettempdir(), "logplot-mcp.json")
+
+MCP_INSTRUCTIONS = (
+    "logplot is a GUI log viewer running on this machine; the human user sees every "
+    "change immediately. All timestamps are Unix seconds (UTC, float) with microsecond "
+    "resolution available. Only the listed tools exist -- there is no shell, no file "
+    "write and no way to remove data. Windowed queries return aggregated or "
+    "down-sampled data, never raw million-row series."
+)
 
 
 class SeriesState:
@@ -663,6 +683,11 @@ class CSVPlotViewer(QMainWindow):
         update_action.triggered.connect(self.update_script)
         help_menu.addAction(update_action)
 
+        self.mcp_info_action = QAction("MCP Server: off", self)
+        self.mcp_info_action.setEnabled(False)
+        self.mcp_info_action.setVisible(False)
+        help_menu.addAction(self.mcp_info_action)
+
 
     def show_usage_dialog(self):
         help_text = f"""
@@ -715,6 +740,12 @@ class CSVPlotViewer(QMainWindow):
     <li>在右側樹狀圖中勾選要搜尋的文字序列。</li>
     <li>在下方的搜尋框中輸入文字並按 Enter 鍵。</li>
     <li>搜尋結果會顯示在下方表格。雙擊結果可跳轉至對應時間點。</li>
+</ul>
+<h3>MCP Server (外部 Agent 控制):</h3>
+<ul>
+    <li>啟動時即於 <b>127.0.0.1:8790</b> 開啟 MCP 端點，讓外部 agent 直接操作此視窗；<b>--mcp-port PORT</b> 可換埠，<b>--mcp-port 0</b> 可關閉。</li>
+    <li>端點 URL: <b>http://127.0.0.1:PORT/mcp</b>；可用 <b>--mcp-token</b> 或環境變數 <b>LOGPLOT_MCP_TOKEN</b> 要求 Bearer 驗證。</li>
+    <li>連線資訊同時寫在 <b>{MCP_DISCOVERY_PATH}</b>。</li>
 </ul>
         """
         QMessageBox.about(self, "LogPlot Usage", help_text)
@@ -2033,6 +2064,449 @@ class CSVPlotViewer(QMainWindow):
 
 
 
+    # --- MCP server (Phase 1) ---
+
+    def start_mcp_server(self, port=MCP_DEFAULT_PORT, token=None):
+        """Start the localhost MCP endpoint and announce it; returns the bound port."""
+        self.mcp_bridge = McpBridge(self)
+        self.mcp_server = McpHttpServer(self.mcp_bridge, port, token)
+        self.mcp_server.start()
+
+        url = f"http://127.0.0.1:{self.mcp_server.port}/mcp"
+        try:
+            # Never write the token itself: this file is world-readable in %TEMP%.
+            with open(MCP_DISCOVERY_PATH, "w", encoding="utf-8") as f:
+                json.dump({"url": url, "port": self.mcp_server.port,
+                           "auth": "bearer" if token else "none",
+                           "pid": os.getpid()}, f, indent=2)
+        except OSError:
+            pass
+
+        self.mcp_info_action.setText(
+            f"MCP Server: 127.0.0.1:{self.mcp_server.port} ({'token required' if token else 'no auth'})"
+        )
+        self.mcp_info_action.setVisible(True)
+        self.statusBar().showMessage(f"MCP server listening on {url}")
+        print(f"[mcp] listening on {url} (details: {MCP_DISCOVERY_PATH})")
+        return self.mcp_server.port
+
+    def stop_mcp_server(self):
+        """Shut the MCP endpoint down and remove its discovery file."""
+        server = getattr(self, "mcp_server", None)
+        if server is None:
+            return
+        server.stop()
+        self.mcp_server = None
+        try:
+            os.remove(MCP_DISCOVERY_PATH)
+        except OSError:
+            pass
+
+    def closeEvent(self, event):
+        self.stop_mcp_server()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
+# MCP server: lets an external agent (e.g. omp) drive this running logplot
+# instance over localhost. Hand-written JSON-RPC 2.0 subset of the MCP
+# Streamable HTTP transport -- initialize, notifications/initialized, ping,
+# tools/list, tools/call -- so it needs no dependency beyond the stdlib.
+#
+# Threading: HTTP runs on a daemon thread; every tool call is marshalled back
+# to the GUI thread through McpBridge.call_requested, because self.series,
+# self.model and the ViewBoxes may only be touched there.
+# ---------------------------------------------------------------------------
+
+# MCP_PROTOCOL_VERSION and friends live at the top of the file: they are used as
+# default arguments, which Python evaluates at class-definition time.
+# ---------------------------------------------------------------------------
+
+
+class _McpError(Exception):
+    """A JSON-RPC level error (protocol problems, not tool failures)."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _McpJob:
+    """One tool invocation travelling from the HTTP thread to the GUI thread."""
+
+    __slots__ = ("name", "args", "event", "result", "error")
+
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+
+
+class McpBridge(QObject):
+    """Owns the tool table and runs every tool on the GUI thread."""
+
+    call_requested = Signal(object)
+
+    def __init__(self, viewer):
+        super().__init__()
+        self.viewer = viewer
+        self.tools = {}
+        self._register_tools()
+        # AutoConnection + different thread affinity => queued delivery.
+        self.call_requested.connect(self._run_job)
+
+    # --- registry ---
+
+    def _add_tool(self, name, description, schema, fn):
+        self.tools[name] = (description, schema, fn)
+
+    def list_tools(self):
+        return [
+            {"name": name, "description": description, "inputSchema": schema}
+            for name, (description, schema, _fn) in self.tools.items()
+        ]
+
+    def call(self, name, arguments, timeout=MCP_CALL_TIMEOUT):
+        """Block the calling (HTTP) thread until the GUI thread finished the tool."""
+        if name not in self.tools:
+            raise KeyError(name)
+        if not isinstance(arguments, dict):
+            raise ValueError("'arguments' must be an object")
+
+        job = _McpJob(name, arguments)
+        self.call_requested.emit(job)
+        if not job.event.wait(timeout):
+            raise TimeoutError(
+                f"tool '{name}' did not run within {timeout:.0f}s (is a modal dialog open?)"
+            )
+        if job.error is not None:
+            raise ValueError(job.error)
+        return job.result
+
+    def _run_job(self, job):
+        """GUI thread: execute one tool call and release the waiting HTTP thread."""
+        try:
+            job.result = self.tools[job.name][2](job.args)
+        except Exception as exc:
+            job.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            job.event.set()
+
+    def _register_tools(self):
+        self._add_tool(
+            "load_files",
+            "Load CSV or CSV.ZST log files into the viewer. Returns row count and time "
+            "range (Unix seconds) for each file. Files already loaded are left untouched.",
+            {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Absolute paths of CSV / CSV.ZST files to load.",
+                    }
+                },
+                "required": ["paths"],
+                "additionalProperties": False,
+            },
+            self._tool_load_files,
+        )
+        self._add_tool(
+            "list_files",
+            "List the log files currently loaded in the viewer, with row/column counts and "
+            "time range (Unix seconds). Files stay loaded until the human removes them.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self._tool_list_files,
+        )
+        self._add_tool(
+            "list_series",
+            "List the signal names available in the loaded files, split into numeric_series "
+            "and string_series, plus which ones are currently plotted. These names are what "
+            "the other tools take as 'column'.",
+            {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Exact path of one loaded file as reported by list_files. "
+                                       "Omit to list every loaded file.",
+                    }
+                },
+                "additionalProperties": False,
+            },
+            self._tool_list_series,
+        )
+
+    # --- tools ---
+
+    def _describe_file(self, path, df):
+        """The per-file summary shared by load_files and list_files."""
+        return {
+            "file": path,
+            "name": os.path.basename(path),
+            "rows": int(len(df)),
+            "columns": int(df.shape[1]),
+            "start": float(df.index[0]) / 1e9 if len(df) else None,
+            "end": float(df.index[-1]) / 1e9 if len(df) else None,
+        }
+
+    def _resolve_file(self, name):
+        """Map a 'file' argument to a loaded key: exact, path-normalised, or unique basename."""
+        if name in self.viewer.dataframes:
+            return name
+        target = os.path.normcase(os.path.abspath(name))
+        for key in self.viewer.dataframes:
+            if os.path.normcase(os.path.abspath(key)) == target:
+                return key
+        hits = [k for k in self.viewer.dataframes if os.path.basename(k) == os.path.basename(name)]
+        if len(hits) == 1:
+            return hits[0]
+        known = list(self.viewer.dataframes)
+        raise ValueError(
+            f"unknown file {name!r}; loaded: {known[:20]}"
+            + (f" (+{len(known) - 20} more)" if len(known) > 20 else "")
+        )
+
+    def _tool_load_files(self, args):
+        paths = args.get("paths")
+        if isinstance(paths, str):
+            paths = [paths]
+        if not isinstance(paths, list) or not paths:
+            raise ValueError("'paths' must be a non-empty list of file paths")
+
+        wanted, loaded, failed = [], [], []
+        for raw in paths:
+            if isinstance(raw, str) and raw.strip():
+                wanted.append(raw.strip())
+            else:
+                failed.append({"file": str(raw), "reason": "not a non-empty string"})
+
+        to_load = [p for p in wanted if p not in self.viewer.dataframes]
+        if to_load:
+            self.viewer.load_csv_files(to_load)
+
+        for path in wanted:
+            df = self.viewer.dataframes.get(path)
+            if df is None:
+                failed.append({"file": path, "reason": "not loaded (missing, empty, or unreadable)"})
+                continue
+            entry = self._describe_file(path, df)
+            if path not in to_load:
+                entry["already_loaded"] = True
+            loaded.append(entry)
+        return {"loaded": loaded, "failed": failed}
+
+    def _tool_list_files(self, args):
+        return {"files": [self._describe_file(path, df)
+                          for path, df in self.viewer.dataframes.items()]}
+
+    def _tool_list_series(self, args):
+        requested = args.get("file")
+        if requested is None or requested == "":
+            targets = list(self.viewer.dataframes)
+        elif not isinstance(requested, str):
+            raise ValueError("'file' must be a string")
+        else:
+            targets = [self._resolve_file(requested)]
+
+        files = []
+        for path in targets:
+            df = self.viewer.dataframes[path]
+            numeric, strings, plotted, tracked, labels = [], [], [], [], {}
+            truncated = False
+
+            for col in df.columns:
+                if len(numeric) + len(strings) >= MCP_MAX_SERIES_PER_FILE:
+                    truncated = True
+                    break
+                name = str(col)
+                ss = self.viewer.series.get((path, col))
+                if ss is not None and ss.is_string_type:
+                    strings.append(name)
+                else:
+                    numeric.append(name)
+                if ss is None:
+                    continue
+                if ss.is_active:
+                    plotted.append(name)
+                if (path, col) in self.viewer.active_text_series:
+                    tracked.append(name)
+                if ss.display_name != name:
+                    labels[name] = ss.display_name
+
+            entry = {
+                "file": path,
+                "series_count": int(df.shape[1]),
+                "numeric_series": numeric,
+                "string_series": strings,
+                "plotted": plotted,
+                "truncated": truncated,
+            }
+            if tracked:
+                entry["text_tracked"] = tracked
+            if labels:
+                entry["labels"] = labels
+            files.append(entry)
+        return {"files": files}
+
+
+class _McpHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class McpHttpServer:
+    """Minimal MCP Streamable HTTP endpoint bound to 127.0.0.1."""
+
+    def __init__(self, bridge, port, token=None):
+        self.bridge = bridge
+        self.token = token or None
+        self._httpd = _McpHTTPServer(("127.0.0.1", port), self._make_handler())
+        self.port = int(self._httpd.server_address[1])
+        self._thread = None
+
+    # --- lifecycle ---
+
+    def start(self):
+        self._thread = threading.Thread(target=self._httpd.serve_forever, name="logplot-mcp", daemon=True)
+        self._thread.start()
+        return self.port
+
+    def stop(self):
+        try:
+            self._httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self._httpd.server_close()
+        except Exception:
+            pass
+
+    # --- JSON-RPC ---
+
+    def handle_message(self, message):
+        """Return the JSON-RPC response dict, or None for a notification."""
+        method = message.get("method")
+        msg_id = message.get("id")
+        params = message.get("params")
+        if not isinstance(params, dict):
+            params = {}
+
+        if msg_id is None:  # notification (e.g. notifications/initialized)
+            return None
+
+        try:
+            result = self._dispatch(method, params)
+        except _McpError as exc:
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "error": {"code": exc.code, "message": exc.message}}
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+    def _dispatch(self, method, params):
+        if method == "initialize":
+            requested = params.get("protocolVersion")
+            version = requested if requested in MCP_SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            return {
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "logplot", "version": VERSION},
+                "instructions": MCP_INSTRUCTIONS,
+            }
+        if method == "ping":
+            return {}
+        if method == "tools/list":
+            return {"tools": self.bridge.list_tools()}
+        if method == "tools/call":
+            return self._call_tool(params)
+        raise _McpError(-32601, f"method not found: {method}")
+
+    def _call_tool(self, params):
+        name = params.get("name")
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+        if name not in self.bridge.tools:
+            return self._tool_error(f"unknown tool: {name}")
+        if not isinstance(arguments, dict):
+            return self._tool_error("'arguments' must be an object")
+        try:
+            result = self.bridge.call(name, arguments)
+        except Exception as exc:
+            return self._tool_error(str(exc))
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}],
+                "isError": False}
+
+    @staticmethod
+    def _tool_error(message):
+        return {"content": [{"type": "text", "text": message}], "isError": True}
+
+    # --- HTTP ---
+
+    def _make_handler(self):
+        mcp = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            server_version = "logplot-mcp/" + VERSION
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _respond(self, code, payload=None):
+                body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                if payload is not None:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def _authorized(self):
+                if mcp.token is None:
+                    return True
+                return self.headers.get("Authorization", "") == f"Bearer {mcp.token}"
+
+            def do_POST(self):
+                if urlsplit(self.path).path != "/mcp":
+                    self._respond(404, {"error": "not found"})
+                    return
+                if not self._authorized():
+                    self._respond(401, {"error": "unauthorized"})
+                    return
+
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    self._respond(400, {"jsonrpc": "2.0", "id": None,
+                                        "error": {"code": -32700, "message": "parse error"}})
+                    return
+                if not isinstance(message, dict):
+                    self._respond(400, {"jsonrpc": "2.0", "id": None,
+                                        "error": {"code": -32600, "message": "invalid request"}})
+                    return
+
+                response = mcp.handle_message(message)
+                if response is None:
+                    self._respond(202)  # notification accepted, no body
+                else:
+                    self._respond(200, response)
+
+            def do_GET(self):
+                # No SSE stream offered: 405 makes clients silently drop theirs.
+                self._respond(405, {"error": "method not allowed"})
+
+            def do_DELETE(self):
+                self._respond(200)
+
+        return _Handler
+
+
 def main():
     # import pyqtgraph.examples
     # pyqtgraph.examples.run()
@@ -2045,12 +2519,21 @@ def main():
 
     parser = ArgumentParser(description=__doc__.strip())
     parser.add_argument('files', nargs='*', action="store", help='CSV file')
+    parser.add_argument('--mcp-port', type=int, default=MCP_DEFAULT_PORT,
+                        help=f'Port for the localhost MCP server, 0 disables it (default: {MCP_DEFAULT_PORT})')
+    parser.add_argument('--mcp-token', default=os.environ.get('LOGPLOT_MCP_TOKEN'),
+                        help='Bearer token the MCP server requires (default: $LOGPLOT_MCP_TOKEN)')
     args = parser.parse_args()
     if args.files:
         try:
             window.load_csv_files(args.files)
         except Exception as e:
             print(f"Error loading file {args.file}: {e}")
+    if args.mcp_port:
+        try:
+            window.start_mcp_server(args.mcp_port, args.mcp_token)
+        except OSError as e:
+            print(f"[mcp] could not listen on 127.0.0.1:{args.mcp_port}: {e}")
     sys.exit(app.exec())
 
 if __name__ == "__main__":
