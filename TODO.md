@@ -75,6 +75,9 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - Phase 2 真實檔案交叉比對：`find_changes` 全檔（328,746 樣本 × 125 欄）**729 ms / 10.5 KB**、1 小時 **37 ms**；`unchanged_series = 34` 與獨立量測一致，`alarm_data` 47、`mpc_ctrl_t_play` 280,140、`t_elapsed` 280,140、`pos_1` 257,490、`mpc_ctrl_mode` 333、`st_1` 922 全部吻合。`get_window` 1 小時：`mpc_ctrl_mode` 18 段 / 0.82 KB / 1.9 ms、`mpc_ctrl_cali_1` 1 段、`alarm_data` 1 段（整小時空白）、`t_elapsed` 走 `dense`（15,074 段略去，0.50 KB）。
 - 這輪在真實資料上抓到兩個 fixture 沒涵蓋的缺陷：物件欄的 NaN 被當成「每樣本都變」（`alarm_data` 誤報 324,428 次，實際 47 次）、以及 `to_numpy()` 把 4,100 萬個元素裝箱成 object 陣列導致全檔掃描要 2.7 s（改為逐欄 `shift()` 比較後 0.73 s）。
 - Phase 2 工具：`list_files` / `list_series` 以四種檔案寫法（完整路徑 / basename / 反斜線 / 全小寫）呼叫皆命中；未知檔回錯誤並列出已載入檔案；400 欄不截斷、500 欄截斷成 400 並標 `truncated`；`plotted` / `labels` / `text_tracked` 以臨時腳本驅動真實 `CSVPlotViewer` 驗證（數值曲線、2 值的分類字串、20 值的字串只追蹤不繪圖、改名後的 label、空欄位省略）。
+- 抖動量化（suggest.md 痛點 3）：`servo_alarm_code_2` 整檔的精確變化清單是 **496 段 / 13.19 KB**（報告估「約 450 筆」，實測 496），`min_duration=60` → 160 段 / 4.50 KB、`min_duration=300` → 26 段 / 1.00 KB。
+- A 組（suggest.md 回饋）：26 列 fixture 逐項驗過 `file` 省略／完整路徑／basename 三者一致、多檔時要求 `file`、`transitions`（`from=null` 起始、`held` 由下一段推出、最後一段算到 `t2`）、`min_duration`（含 1.0 s 邊界、去抖後同值段合併、`segments_before`）、`drop_dominant`（`dominant` 與偏離區間、搭配 `transitions` 時報錯）、`dense` 數值分布、ISO 輸入（本地／UTC／帶 `Z`）與 `time_format=iso`，以及 6 種參數錯誤訊息。時間欄位一律斷言為 JSON 數字 —— 這抓到 numpy 純量會被 HTTP 層的 `default=str` 轉成字串的 bug。
+- 用 suggest.md 的案例端到端複驗：`log-htb-20260101.log_mpc_ctrl_101.csv.zst` 的 07:36–07:41 窗，`get_window(mpc_ctrl_mode, mode=transitions, time_format=iso)` 一次呼叫（1 ms / 0.90 KB）即重現報告中的中止 A 與 B（`playing → halt` @ 07:37:20.308 held 27.388927 s；@ 07:40:21.972 held 28.651019 s）—— 報告是肉眼比對 348 筆 segment 得出的。`drop_dominant` 對 `mpc_ctrl_state` 在同一窗直接給出 6 段偏離區間（正好是兩次 playing→halt→parking）。`find_changes` 整檔 `unchanged_columns` = 31 條，與報告數字一致。
 
 ## 工具清單（每項對應既有 method）
 
@@ -83,8 +86,8 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 | `load_files(paths)` | `load_csv_files`（:927） | ✅ Phase 1 |
 | `list_files()` | `dataframes` → 逐檔 rows / columns / start / end | ✅ Phase 2 |
 | `list_series(file?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels` / `kinds`（不回數值） | ✅ Phase 2 |
-| `find_changes(t1, t2, file?)` | 逐欄 `shift()` 比較，回有變化的訊號與次數（忙的在前）；篩選層 | ✅ Phase 2 |
-| `get_window(file, column, t1, t2, max_points?)` | 變化清單（精確 RLE），超出預算則轉 `dense` 摘要 | ✅ Phase 2 |
+| `find_changes(t1, t2, file?, limit?, time_format?)` | 逐欄 `shift()` 比較，回有變化的訊號與次數（忙的在前）+ 未變動的欄名；篩選層 | ✅ Phase 2 |
+| `get_window(file?, column, t1, t2, max_points?, mode?, min_duration?, drop_dominant?, time_format?)` | 變化清單（精確 RLE）／`transitions`／`deviations`，超出預算轉 `dense` | ✅ Phase 2 |
 | `search_text(q)` | `search_input.setText` + `search_global_text()`（:1923） | Phase 2 |
 | `get_view_range` | `main_vb.viewRange()` | Phase 2 |
 | `plot_series` / `unplot_series` | `column_item.setCheckState()` → `on_item_changed`（:1056） | Phase 3 |
@@ -105,8 +108,13 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - 注意：`list_series` 第一次讀一檔會替每欄做一次全欄 distinct 計數（125 欄實測約 0.5 s，在 GUI thread），之後由 `SeriesState` 快取（1.4 ms）。勾選路徑因此不再重算。
 - **時間視窗的表示法（`find_changes` / `get_window` 共用）**：變化清單 `segments: [[t, value], …]`，值的有效範圍**到下一段為止**（最後一段到 `t2`），頭尾相連故不重複 `t_end`。區間是雙端閉區間；`t ≥ 1e11` 沿用 `search_by_timestamp` 的規則視為 ns。
 - **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。
-- `get_window` 的 `mode`：`segments`（段數 ≤ `max_points`，零資訊損失）／`dense`（超預算，改回 `stats` + `extremes`，字串欄改回值的分佈含空白）。`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)。
 - **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_segment_starts()` 用 `pd.isna` 做這個遮罩；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
+- **`file` 可省略**：只載入一個檔案時 `get_window` 不必帶 `file`；`file` 也接受唯一 basename（`_resolve_file(..., allow_default=True)`）。多檔時才回錯並列出已載入檔案。
+- **四種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四者共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（低基數數值其實是代碼）。
+- **`min_duration`（去抖動）**：短於 N 秒的區段直接丟棄、由前一段延伸覆蓋，去抖後相鄰同值再合併（`_merge_equal_runs`），並回報 `segments_before` 以示透明。`drop_dominant` 只保留「佔用時間最長的值」以外的區間。
+- **時間格式**：`t1` / `t2` 接受 Unix 秒或 ISO 8601（naive 字串用 viewer 時區解讀）；`time_format: "iso"` 讓回應的時間全部變成帶偏移的 ISO 字串（毫秒先四捨五入再格式化，避免看起來差 1 ms）。回應一律附 `tz`（如 `+08:00`）。
+- **`find_changes` 的 `unchanged_columns`** 只在單一檔案時提供（多檔時裸欄名有歧義），並受 `limit` 上限。
+- **不採納「呼叫端覆寫 `kind`」**（suggest.md 建議）：實測後確認 `kind` 在 `get_window` 內只影響 metadata，dense 分支是依 `dtype` 判斷，而低基數數值的分布已由 `dense` 的 `values` 提供，所以覆寫參數會是個沒有實際作用的多餘欄位。
 
 ## 待辦
 

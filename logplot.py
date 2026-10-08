@@ -2206,6 +2206,41 @@ def _segment_starts(values):
     return np.flatnonzero(np.concatenate(([True], ~same)))
 
 
+def _viewer_tz(utc_offset):
+    """The viewer's axis offset as a timezone (utcOffset is seconds, negative east of UTC)."""
+    return timezone(timedelta(seconds=-utc_offset))
+
+
+def _offset_text(utc_offset):
+    """The viewer's offset as text, e.g. "+08:00"."""
+    east_minutes = -(int(round(utc_offset)) // 60)
+    hours, minutes = divmod(abs(east_minutes), 60)
+    return ("+" if east_minutes >= 0 else "-") + f"{hours:02d}:{minutes:02d}"
+
+
+def _drop_short_runs(times, min_duration, end):
+    """Positions of the runs lasting at least min_duration seconds.
+
+    The first run is always kept and a dropped run simply extends the previous one, so the
+    result stays contiguous: this is a debounce, not a hole punch.
+    """
+    keep = [0]
+    for i in range(1, len(times)):
+        stop = times[i + 1] if i + 1 < len(times) else end
+        if stop - times[i] >= min_duration:
+            keep.append(i)
+    return np.array(keep, dtype=int)
+
+
+def _merge_equal_runs(times, values):
+    """Drop runs whose value repeats the previous one (only possible after a debounce)."""
+    if len(times) < 2:
+        return times, values
+    keys = [_json_value(v) for v in values]
+    keep = [0] + [i for i in range(1, len(keys)) if keys[i] != keys[i - 1]]
+    return times[keep], values[keep]
+
+
 class McpBridge(QObject):
     """Owns the tool table and runs every tool on the GUI thread."""
 
@@ -2294,8 +2329,8 @@ class McpBridge(QObject):
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Exact path of one loaded file as reported by list_files. "
-                                       "Omit to list every loaded file.",
+                        "description": "One loaded file, by path as reported by list_files or by a "
+                                       "unique basename. Omit to list every loaded file.",
                     }
                 },
                 "additionalProperties": False,
@@ -2306,16 +2341,22 @@ class McpBridge(QObject):
             "find_changes",
             "Screen which signals changed inside a time window: one row per signal that moved, "
             "with how many times it changed, busiest first. Use it before reading any signal in "
-            "detail. Signal names are what get_window takes as 'column'.",
+            "detail. When a single file is in scope, the signals that did not move are named too. "
+            "Signal names are what get_window takes as 'column'.",
             {
                 "type": "object",
                 "properties": {
-                    "t1": {"type": "number", "description": "Window start, Unix seconds."},
-                    "t2": {"type": "number", "description": "Window end, Unix seconds (inclusive)."},
+                    "t1": {"type": ["number", "string"],
+                           "description": "Window start: Unix seconds, or an ISO 8601 timestamp."},
+                    "t2": {"type": ["number", "string"],
+                           "description": "Window end (inclusive), same formats as t1."},
                     "file": {"type": "string",
-                             "description": "Limit to one loaded file (see list_files). Omit for all."},
+                             "description": "Limit to one loaded file, by path or unique basename "
+                                            "(see list_files). Omit to screen every loaded file."},
                     "limit": {"type": "integer",
-                              "description": f"Max rows to return, default {MCP_MAX_CHANGED_SERIES}."},
+                              "description": f"Max rows and max unchanged names, default {MCP_MAX_CHANGED_SERIES}."},
+                    "time_format": {"type": "string",
+                                    "description": "'unix' (default) or 'iso' for the returned times."},
                 },
                 "required": ["t1", "t2"],
                 "additionalProperties": False,
@@ -2324,22 +2365,42 @@ class McpBridge(QObject):
         )
         self._add_tool(
             "get_window",
-            "Read one signal over a time window as its change list: segments of [time, value] "
-            "where the value holds until the next segment (the last holds until t2). Exact and "
-            "complete when the signal has few changes; if it exceeds max_points the reply turns "
-            "into a bounded summary (mode 'dense') instead.",
+            "Read one signal over a time window. By default the reply is its change list: "
+            "[time, value] segments, each value holding until the next segment and the last "
+            "until t2, which is exact and complete whenever the signal changes few times. "
+            "mode 'transitions' returns one row per change instead ([time, from, to, "
+            "held_seconds]). min_duration drops runs shorter than N seconds and drop_dominant "
+            "keeps only the runs that are not the value holding the most time -- both turn "
+            "per-second jitter into the events that matter. If what is left does not fit "
+            "max_points the reply becomes a bounded summary (mode 'dense', with stats and a "
+            "value distribution for low-cardinality signals).",
             {
                 "type": "object",
                 "properties": {
-                    "file": {"type": "string", "description": "Loaded file (see list_files)."},
+                    "file": {"type": "string",
+                             "description": "Loaded file, by path or unique basename (see list_files). "
+                                            "May be omitted while exactly one file is loaded."},
                     "column": {"type": "string", "description": "Signal name (see list_series)."},
-                    "t1": {"type": "number", "description": "Window start, Unix seconds."},
-                    "t2": {"type": "number", "description": "Window end, Unix seconds (inclusive)."},
+                    "t1": {"type": ["number", "string"],
+                           "description": "Window start: Unix seconds, or an ISO 8601 timestamp "
+                                          "read in the viewer's timezone."},
+                    "t2": {"type": ["number", "string"],
+                           "description": "Window end (inclusive), same formats as t1."},
                     "max_points": {"type": "integer",
-                                   "description": f"Segment budget, default {MCP_MAX_WINDOW_POINTS}, "
+                                   "description": f"Budget, default {MCP_MAX_WINDOW_POINTS}, "
                                                   f"max {MCP_WINDOW_POINT_CAP}."},
+                    "mode": {"type": "string",
+                             "description": "'segments' (default) or 'transitions'."},
+                    "min_duration": {"type": "number",
+                                     "description": "Drop runs shorter than this many seconds. "
+                                                    "Default 0 = keep every change."},
+                    "drop_dominant": {"type": "boolean",
+                                      "description": "Only keep runs whose value is not the one "
+                                                     "holding the most time (mode 'segments' only)."},
+                    "time_format": {"type": "string",
+                                    "description": "'unix' (default) or 'iso' for the returned times."},
                 },
-                "required": ["file", "column", "t1", "t2"],
+                "required": ["column", "t1", "t2"],
                 "additionalProperties": False,
             },
             self._tool_get_window,
@@ -2358,8 +2419,23 @@ class McpBridge(QObject):
             "end": float(df.index[-1]) / 1e9 if len(df) else None,
         }
 
-    def _resolve_file(self, name):
-        """Map a 'file' argument to a loaded key: exact, path-normalised, or unique basename."""
+    def _resolve_file(self, name, allow_default=False):
+        """Map a 'file' argument to a loaded key: exact, path-normalised, or unique basename.
+
+        With allow_default, a missing name selects the only loaded file.
+        """
+        if name is None or (isinstance(name, str) and not name.strip()):
+            if allow_default and len(self.viewer.dataframes) == 1:
+                return next(iter(self.viewer.dataframes))
+            known = list(self.viewer.dataframes)
+            if not known:
+                raise ValueError("no file is loaded")
+            raise ValueError(
+                f"'file' is required when several files are loaded; loaded: {known[:20]}"
+                + (f" (+{len(known) - 20} more)" if len(known) > 20 else "")
+            )
+        if not isinstance(name, str):
+            raise ValueError("'file' must be a string")
         if name in self.viewer.dataframes:
             return name
         target = os.path.normcase(os.path.abspath(name))
@@ -2470,15 +2546,36 @@ class McpBridge(QObject):
         """Unix seconds -> ns. Values >= 1e11 are taken as ns, like search_by_timestamp."""
         return int(t) if t >= 1e11 else int(t * 1e9)
 
-    @staticmethod
-    def _window_args(args):
-        t1, t2 = args.get("t1"), args.get("t2")
-        for name, value in (("t1", t1), ("t2", t2)):
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"'{name}' must be a number (Unix seconds)")
+    def _window_time(self, value, name):
+        """Unix seconds, or an ISO 8601 string read in the viewer's timezone."""
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError(f"'{name}' must be Unix seconds or an ISO 8601 timestamp, got {value!r}")
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_viewer_tz(self.viewer.x_axis.utcOffset))
+            return parsed.timestamp()
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"'{name}' must be a number (Unix seconds) or an ISO 8601 string")
+        return float(value)
+
+    def _window_args(self, args):
+        t1, t2 = self._window_time(args.get("t1"), "t1"), self._window_time(args.get("t2"), "t2")
         if t1 > t2:
             raise ValueError(f"t1 ({t1}) must be <= t2 ({t2})")
-        return float(t1), float(t2)
+        return t1, t2
+
+    def _time_formatter(self, args):
+        """Times go out as Unix seconds by default, or as ISO 8601 in the viewer's timezone."""
+        time_format = args.get("time_format", "unix")
+        if time_format not in ("unix", "iso"):
+            raise ValueError("'time_format' must be 'unix' or 'iso'")
+        tz = _viewer_tz(self.viewer.x_axis.utcOffset)
+        if time_format == "unix":
+            return lambda t: float(t), tz     # float(): numpy scalars would serialise as strings
+        # round first: timespec="milliseconds" truncates, which reads as an off-by-one-ms
+        return lambda t: datetime.fromtimestamp(round(float(t), 3), tz).isoformat(timespec="milliseconds"), tz
 
     @staticmethod
     def _positive_int(value, name, cap=None):
@@ -2495,11 +2592,13 @@ class McpBridge(QObject):
 
     def _tool_find_changes(self, args):
         t1, t2 = self._window_args(args)
+        fmt, _tz = self._time_formatter(args)
         requested = args.get("file")
         targets = [self._resolve_file(requested)] if requested else list(self.viewer.dataframes)
         limit = self._positive_int(args.get("limit", MCP_MAX_CHANGED_SERIES), "limit")
+        single = len(targets) == 1         # only then are bare column names unambiguous
 
-        files, moved, unchanged = [], [], 0
+        files, moved, unchanged, still = [], [], 0, []
         for path in targets:
             df = self.viewer.dataframes[path]
             start, stop = self._window_slice(df, t1, t2)
@@ -2508,6 +2607,8 @@ class McpBridge(QObject):
 
             if len(window) < 2:
                 unchanged += int(df.shape[1])
+                if single:
+                    still.extend(str(c) for c in df.columns)
                 continue
 
             # Per-column comparison keeps each column in its native dtype; going through
@@ -2520,6 +2621,8 @@ class McpBridge(QObject):
                 count = int(count)
                 if count == 0:
                     unchanged += 1
+                    if single:
+                        still.append(str(col))
                     continue
                 ss = self.viewer.series.get((path, col))
                 moved.append({"file": path, "column": str(col),
@@ -2527,18 +2630,33 @@ class McpBridge(QObject):
                               "changed": count})
 
         moved.sort(key=lambda row: -row["changed"])
-        return {"t1": t1, "t2": t2, "files": files,
-                "changed_series": len(moved), "unchanged_series": unchanged,
-                "truncated": len(moved) > limit, "series": moved[:limit]}
+        out = {"t1": fmt(t1), "t2": fmt(t2), "tz": _offset_text(self.viewer.x_axis.utcOffset),
+               "files": files, "changed_series": len(moved), "unchanged_series": unchanged,
+               "truncated": len(moved) > limit, "series": moved[:limit]}
+        if single:
+            out["unchanged_columns"] = still[:limit]
+            out["unchanged_truncated"] = len(still) > limit
+        return out
 
     def _tool_get_window(self, args):
-        path = self._resolve_file(args.get("file"))
+        path = self._resolve_file(args.get("file"), allow_default=True)
         column = args.get("column")
         if not isinstance(column, str) or not column:
             raise ValueError("'column' must be a non-empty string")
         t1, t2 = self._window_args(args)
         max_points = self._positive_int(args.get("max_points", MCP_MAX_WINDOW_POINTS),
                                         "max_points", MCP_WINDOW_POINT_CAP)
+
+        mode = args.get("mode", "segments")
+        if mode not in ("segments", "transitions"):
+            raise ValueError("'mode' must be 'segments' or 'transitions'")
+        drop_dominant = bool(args.get("drop_dominant", False))
+        if drop_dominant and mode != "segments":
+            raise ValueError("'drop_dominant' only applies to mode 'segments'")
+        min_duration = args.get("min_duration", 0)
+        if isinstance(min_duration, bool) or not isinstance(min_duration, (int, float)) or min_duration < 0:
+            raise ValueError("'min_duration' must be a non-negative number of seconds")
+        fmt, _tz = self._time_formatter(args)
 
         df = self.viewer.dataframes[path]
         if column not in df.columns:
@@ -2551,25 +2669,63 @@ class McpBridge(QObject):
 
         out = {"file": path, "column": column,
                "kind": ss.kind if ss is not None else "analog",
-               "t1": t1, "t2": t2, "samples": int(len(values))}
+               "t1": fmt(t1), "t2": fmt(t2), "tz": _offset_text(self.viewer.x_axis.utcOffset),
+               "samples": int(len(values))}
         if len(values) == 0:
-            out["mode"] = "segments"
-            out["segments"] = []
+            out["mode"] = mode
+            out[mode] = []
             return out
 
-        out["sample_start"] = float(index[0]) / 1e9
-        out["sample_end"] = float(index[-1]) / 1e9
+        out["sample_start"] = fmt(float(index[0]) / 1e9)
+        out["sample_end"] = fmt(float(index[-1]) / 1e9)
 
         starts = _segment_starts(values)
-        if len(starts) <= max_points:
-            out["mode"] = "segments"
-            out["segments"] = [[float(index[i]) / 1e9, _json_value(values[i])] for i in starts]
+        times = index[starts] / 1e9                  # a segment starts here ...
+        seg_values = values[starts]
+        if min_duration > 0:
+            kept = _drop_short_runs(times, float(min_duration), t2)
+            if len(kept) != len(times):
+                out["min_duration"] = float(min_duration)
+                out["segments_before"] = int(len(times))
+            times, seg_values = _merge_equal_runs(times[kept], seg_values[kept])
+        ends = np.append(times[1:], t2)              # ... and ends where the next one starts
+
+        if drop_dominant:
+            held = {}
+            for value, span in zip(seg_values, ends - times):
+                key = _json_value(value)
+                held[key] = held.get(key, 0.0) + float(span)
+            dominant = max(held, key=held.get)
+            deviations = [[fmt(t), fmt(e), _json_value(v)]
+                          for t, e, v in zip(times, ends, seg_values)
+                          if _json_value(v) != dominant]
+            if len(deviations) <= max_points:
+                out["mode"] = "deviations"
+                out["dominant"] = dominant
+                out["deviations"] = deviations
+                return out
+
+        if len(times) > max_points:
+            return self._dense_window(out, values, index, times, fmt)
+
+        if mode == "transitions":
+            out["mode"] = "transitions"
+            out["transitions"] = [
+                [fmt(t), _json_value(seg_values[i - 1]) if i else None, _json_value(v),
+                 round(float(e - t), 6)]
+                for i, (t, e, v) in enumerate(zip(times, ends, seg_values))
+            ]
             return out
 
-        # The signal changes on most samples: summarise instead of listing it.
+        out["mode"] = "segments"
+        out["segments"] = [[fmt(t), _json_value(v)] for t, v in zip(times, seg_values)]
+        return out
+
+    def _dense_window(self, out, values, index, times, fmt):
+        """The signal changes on most samples: summarise it instead of listing it."""
         out["mode"] = "dense"
-        out["segments_omitted"] = int(len(starts))
-        out["changed_samples"] = int(len(starts) - 1)   # one change per segment boundary
+        out["segments_omitted"] = int(len(times))
+        out["changed_samples"] = int(len(times) - 1)    # one change per segment boundary
 
         if values.dtype.kind in "OUS":
             counts = pd.Series(values).value_counts(dropna=False)   # blanks are a value too
@@ -2577,23 +2733,30 @@ class McpBridge(QObject):
             out["distinct"] = int(len(counts))
             out["values"] = {str(k): int(v) for k, v in head.items()}
             out["values_truncated"] = bool(len(counts) > len(head))
-        else:
-            numbers = values.astype(float)
-            good = numbers[~np.isnan(numbers)]
-            if len(good) == 0:
-                out["stats"] = None
-            else:
-                lo, hi = int(np.nanargmin(numbers)), int(np.nanargmax(numbers))
-                out["stats"] = {
-                    "min": float(good.min()), "max": float(good.max()),
-                    "mean": float(good.mean()), "std": float(good.std()),
-                    "first": _json_value(values[0]), "last": _json_value(values[-1]),
-                    "nan": int(len(numbers) - len(good)),
-                }
-                out["extremes"] = {
-                    "min": [float(index[lo]) / 1e9, float(numbers[lo])],
-                    "max": [float(index[hi]) / 1e9, float(numbers[hi])],
-                }
+            return out
+
+        numbers = values.astype(float)
+        good = numbers[~np.isnan(numbers)]
+        if len(good) == 0:
+            out["stats"] = None
+            return out
+
+        lo, hi = int(np.nanargmin(numbers)), int(np.nanargmax(numbers))
+        out["stats"] = {
+            "min": float(good.min()), "max": float(good.max()),
+            "mean": float(good.mean()), "std": float(good.std()),
+            "first": _json_value(values[0]), "last": _json_value(values[-1]),
+            "nan": int(len(numbers) - len(good)),
+        }
+        out["extremes"] = {
+            "min": [fmt(float(index[lo]) / 1e9), float(numbers[lo])],
+            "max": [fmt(float(index[hi]) / 1e9), float(numbers[hi])],
+        }
+        distinct = np.unique(good)
+        out["distinct"] = int(len(distinct))
+        if len(distinct) <= MCP_MAX_DISTINCT_VALUES:
+            # a low-cardinality numeric is really a code, so show how the window splits
+            out["values"] = {str(_json_value(v)): int(np.count_nonzero(numbers == v)) for v in distinct}
         return out
 
 
