@@ -5,6 +5,7 @@ logs/
 _old/
 _power-analysis/
 _analysis/
+_tmp/
 docs/
 *.db-shm
 *.db-wal
