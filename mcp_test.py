@@ -1,7 +1,8 @@
 """Contract test for the logplot MCP server: drives a *running* instance over HTTP.
 
 Covers the load transparency (W10), the window housekeeping (W7), the backpressure
-(W8) and the contract smoke over the real logs (W11) of TODO.md's Phase 2.5.
+(W8) and the contract smoke over the real logs (W11) of TODO.md's Phase 2.5, plus the
+GUI control tools (M4 / W9).
 
 Start the server first, then run this:
 
@@ -11,6 +12,7 @@ Start the server first, then run this:
 Needs no dependency beyond the stdlib; exits non-zero if any check fails.
 """
 import itertools
+import base64
 import json
 import os
 import re
@@ -632,6 +634,188 @@ def main():
     check("an over-long pattern is refused",
           "__error__" in call("find_text", {"pattern": "a" * 201}), "")
     check("a missing pattern is an error", "__error__" in call("find_text", {}), "")
+
+    print("\n[M4] plot_series / unplot_series")
+    analog, enum, text_col = "mpc_ctrl_t_play", "mpc_ctrl_mode", "msg"
+    msg = files["log-20260101.log_msg_105.csv.zst"]
+
+    plotted = call("plot_series", {"file": f105["file"], "column": analog})
+    check("plot an analog series", plotted["columns"][0]["status"] == "plotted",
+          json.dumps(plotted)[:200])
+    check("list_series agrees it is plotted",
+          analog in call("list_series", {"file": f105["file"]})["files"][0]["plotted"], "")
+
+    plotted2 = call("plot_series", {"file": f105["file"], "column": enum})
+    check("plot an enum series", plotted2["columns"][0]["status"] == "plotted",
+          json.dumps(plotted2)[:200])
+
+    tracked = call("plot_series", {"file": msg["file"], "column": text_col})
+    check("plot a text series tracks it instead of plotting it",
+          tracked["columns"][0]["status"] == "tracked", json.dumps(tracked)[:200])
+    check("list_series agrees it is tracked",
+          text_col in call("list_series", {"file": msg["file"]})["files"][0].get("text_tracked", []), "")
+
+    again = call("plot_series", {"file": f105["file"], "column": analog})
+    check("plotting again is a no-op with a clear status",
+          again["columns"][0]["status"] == "already_plotted", json.dumps(again)[:200])
+    again_t = call("plot_series", {"file": msg["file"], "column": text_col})
+    check("tracking again is a no-op with a clear status",
+          again_t["columns"][0]["status"] == "already_tracked", json.dumps(again_t)[:200])
+
+    both = call("plot_series", {"file": f105["file"], "columns": [analog, enum]})
+    check("several columns at once", len(both["columns"]) == 2, json.dumps(both)[:200])
+
+    absent = call("plot_series", {"file": f105["file"], "column": "no-such-column"})
+    check("an unknown column comes back absent, not an error",
+          absent["columns"][0]["status"] == "absent" and "__error__" not in absent,
+          json.dumps(absent)[:200])
+
+    # No 'file' means every loaded file: the column exists in exactly the two mpc_ctrl logs.
+    fleet = call("plot_series", {"column": analog})
+    by_status = {}
+    for entry in fleet["columns"]:
+        by_status.setdefault(entry["status"], []).append(os.path.basename(entry["file"]))
+    check("omitting file applies to every loaded file",
+          sorted(by_status.get("plotted", []) + by_status.get("already_plotted", []))
+          == ["log-20260101.log_mpc_ctrl_105.csv.zst",
+              "log-htb-20260101.log_mpc_ctrl_101.csv.zst"],
+          json.dumps(by_status))
+    check("files without the column come back absent",
+          len(by_status.get("absent", [])) == len(LOGS) - 2, json.dumps(by_status))
+
+    un = call("unplot_series", {"column": analog})
+    check("unplotting applies to every loaded file too",
+          sum(1 for e in un["columns"] if e["status"] == "unplotted") == 2
+          and all(e["status"] in ("unplotted", "absent") for e in un["columns"]),
+          json.dumps(un)[:300])
+    check("the curves are gone from both files",
+          analog not in call("list_series", {"file": f105["file"]})["files"][0]["plotted"]
+          and analog not in call("list_series", {"file": f101["file"]})["files"][0]["plotted"], "")
+    un2 = call("unplot_series", {"file": f105["file"], "column": enum})
+    check("unplot an enum series", un2["columns"][0]["status"] == "unplotted", json.dumps(un2)[:200])
+    un3 = call("unplot_series", {"file": msg["file"], "column": text_col})
+    check("unplotting a tracked series untracks it",
+          un3["columns"][0]["status"] == "untracked", json.dumps(un3)[:200])
+    un4 = call("unplot_series", {"file": msg["file"], "column": text_col})
+    check("unplotting again is a no-op",
+          un4["columns"][0]["status"] == "already_unplotted", json.dumps(un4)[:200])
+
+    print("\n[M4] zoom_to / get_view_range")
+    call("plot_series", {"file": f105["file"], "column": analog})   # keep a curve for the y range
+    zt1, zt2 = f105["start"] + 100, f105["start"] + 700
+    zoom = call("zoom_to", {"t1": zt1, "t2": zt2})
+    check("zoom_to reports the x range it set", zoom["x"] == [zt1, zt2], json.dumps(zoom)[:200])
+    check("zoom_to reports a y range while a curve is plotted",
+          "y" in zoom and zoom["y"][0] <= zoom["y"][1], json.dumps(zoom)[:200])
+    view = call("get_view_range", {})
+    check("get_view_range reads back the zoomed x",
+          close(view["main"]["x"][0], zt1, 1e-9) and close(view["main"]["x"][1], zt2, 1e-9),
+          json.dumps(view)[:300])
+    check("get_view_range carries both axes and the tz",
+          all(isinstance(v, float) for v in view["main"]["x"] + view["main"]["y"]
+              + view["right"]["x"] + view["right"]["y"]) and view["tz"], json.dumps(view)[:300])
+    check("a backwards window is an error",
+          "__error__" in call("zoom_to", {"t1": zt2, "t2": zt1}), "")
+
+    print("\n[M4] highlight_range / measure_delta / screenshot_plot")
+    h1 = call("highlight_range", {"ranges": [[zt1, zt2], [zt2 + 10, zt2 + 90]]})
+    check("two bands are drawn and reported",
+          h1["ranges"] == [[zt1, zt2], [zt2 + 10, zt2 + 90]], json.dumps(h1)[:200])
+    h2 = call("highlight_range", {"ranges": [[zt1, zt1 + 30]]})
+    check("a later call replaces the earlier bands", h2["ranges"] == [[zt1, zt1 + 30]],
+          json.dumps(h2)[:200])
+    check("an empty list is an error", "__error__" in call("highlight_range", {"ranges": []}), "")
+    check("a malformed pair is an error",
+          "__error__" in call("highlight_range", {"ranges": [[zt1]]}), "")
+    check("a backwards band is an error",
+          "__error__" in call("highlight_range", {"ranges": [[zt2, zt1]]}), "")
+    check("more than 64 bands is refused",
+          "__error__" in call("highlight_range", {"ranges": [[zt1, zt2]] * 65}), "")
+
+    m1 = call("measure_delta", {"t1": zt1, "t2": zt2})
+    check("measure_delta reports the exact delta", close(m1["delta_s"], zt2 - zt1, 1e-9),
+          json.dumps(m1)[:200])
+    check("measure_delta says it enabled the measurement mode",
+          m1["measure_mode"] is True and "was_enabled" in m1, json.dumps(m1)[:200])
+
+    shot = rpc("tools/call", {"name": "screenshot_plot", "arguments": {}})["result"]
+    image = shot["content"][0]
+    check("screenshot_plot returns image content",
+          image.get("type") == "image" and image.get("mimeType") == "image/png",
+          json.dumps(shot)[:200])
+    png = base64.b64decode(image.get("data", ""))
+    check("the screenshot is a PNG of a real size",
+          png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 1000, f"{len(png)} bytes")
+
+    print("\n[M4] set_timezone")
+    orig = view["tz"]
+    sign = 1 if orig.startswith("+") else -1
+    orig_hours = sign * int(orig[1:3])
+    tz0 = call("set_timezone", {"offset": 0})
+    check("set_timezone to UTC", tz0["tz"] == "+00:00", json.dumps(tz0)[:200])
+    probe = call("get_window", {"file": f105["file"], "column": enum,
+                                "t1": f105["start"], "t2": f105["start"] + 60,
+                                "time_format": "iso"})
+    check("window replies pick up the new offset", probe.get("tz") == "+00:00",
+          repr(probe.get("tz")))
+    back = call("set_timezone", {"offset": orig_hours})
+    check("the timezone is restored", back["tz"] == orig, json.dumps(back)[:200])
+    check("an out-of-range offset is an error",
+          "__error__" in call("set_timezone", {"offset": 13}), "")
+    check("a boolean offset is an error",
+          "__error__" in call("set_timezone", {"offset": True}), "")
+
+    print("\n[M4] compute_series")
+    c1 = call("compute_series", {"file": f105["file"], "column": analog, "mode": "abs"})
+    check("abs creates and names the derived column", c1["column"] == analog + "_abs",
+          json.dumps(c1)[:200])
+    check("the derived column is drawn and listed",
+          c1["column"] in call("list_series", {"file": f105["file"]})["files"][0]["plotted"], "")
+    cw = call("get_window", {"file": f105["file"], "column": c1["column"],
+                             "t1": zt1, "t2": zt2})
+    check("the derived column is readable", cw.get("samples", 0) > 0, json.dumps(cw)[:200])
+    c2 = call("compute_series", {"file": f105["file"], "column": analog, "mode": "1nd"})
+    check("1nd creates the first derivative", c2["column"] == analog + "_1nd",
+          json.dumps(c2)[:200])
+    ref = call("compute_series", {"file": msg["file"], "column": text_col, "mode": "abs"})
+    check("a string series is refused fast, without a modal",
+          "__error__" in ref and "cannot calculate" in ref["__error__"], json.dumps(ref)[:200])
+    check("a bad mode is an error",
+          "__error__" in call("compute_series", {"file": f105["file"], "column": analog,
+                                                 "mode": "mean"}), "")
+    check("an unknown column is an error",
+          "__error__" in call("compute_series", {"file": f105["file"], "column": "nope",
+                                                 "mode": "abs"}), "")
+
+    print("\n[M4] search_text")
+    none = call("search_text", {"q": "halt"})
+    check("with nothing checked the error names the fix",
+          "__error__" in none and "no free-text series" in none["__error__"],
+          json.dumps(none)[:200])
+
+    call("plot_series", {"file": msg["file"], "column": text_col})
+    s1 = call("search_text", {"q": "halt"})
+    check("the GUI search finds the same 37 halt lines find_text counts",
+          s1["matches_found"] == 37, json.dumps(s1)[:200])
+    check("the hits are [t, file, column, value] in time order",
+          len(s1["matches"]) == 37 and all(len(row) == 4 for row in s1["matches"])
+          and [row[0] for row in s1["matches"]] == sorted(row[0] for row in s1["matches"]),
+          json.dumps(s1["matches"][:2])[:200])
+    s2 = call("search_text", {"q": "halt", "limit": 5})
+    check("limit truncates the list but not the count",
+          len(s2["matches"]) == 5 and s2["matches_found"] == 37 and s2["truncated"] is True,
+          json.dumps(s2)[:200])
+    s3 = call("search_text", {"q": "halt", "time_format": "iso"})
+    check("iso times come back as strings",
+          isinstance(s3["matches"][0][0], str) and "T" in s3["matches"][0][0],
+          json.dumps(s3["matches"][0])[:200])
+    bad = call("search_text", {"q": "halt("})
+    check("a broken regex is a clear error",
+          "__error__" in bad and "regular expression" in bad["__error__"], json.dumps(bad)[:200])
+    un5 = call("unplot_series", {"file": msg["file"], "column": text_col})
+    check("untracking brings the error back",
+          un5["columns"][0]["status"] == "untracked"
+          and "__error__" in call("search_text", {"q": "halt"}), json.dumps(un5)[:200])
 
     print("\n[W8] backpressure")
     busy_file = f105["file"]

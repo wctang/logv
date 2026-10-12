@@ -15,6 +15,7 @@ import sys
 import random
 import os
 import json
+import base64
 import hashlib
 import time
 import re
@@ -33,12 +34,12 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QDoubleSpinBox, QPushButton, QLabel, QLineEdit, QMessageBox,
     QTableWidget, QTableWidgetItem, QHBoxLayout, QInputDialog
 )
-from PySide6.QtGui import QAction, QStandardItemModel, QStandardItem, QColor, QBrush, QActionGroup, QCursor
-from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtGui import QAction, QStandardItemModel, QStandardItem, QColor, QBrush, QActionGroup, QCursor, QImage
+from PySide6.QtCore import Qt, QObject, Signal, QBuffer, QIODevice
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20260930"
+VERSION = "20261012"
 
 # How a series is drawn, decided by counting the distinct values of its whole column
 # (see SeriesState.kind). A string column with >= STRING_TEXT_THRESHOLD distinct values is
@@ -76,9 +77,12 @@ MCP_INSTRUCTIONS = (
     "logplot is a GUI log viewer running on this machine; the human user sees every "
     "change immediately. All timestamps are Unix seconds (UTC, float) with microsecond "
     "resolution available. Only the listed tools exist -- there is no shell, no file "
-    "write and no way to remove data. A time window is answered with the signal's change "
+    "write and no way to remove data. A time window is answered with the change "
     "list when that fits, otherwise with a bounded summary; a raw million-row series is "
-    "never returned."
+    "never returned. The view tools (plot_series, unplot_series, compute_series, "
+    "zoom_to, highlight_range, measure_delta, set_timezone, search_text, screenshot_plot) "
+    "change what the user sees on screen: use them to show the user your findings, "
+    "not to compute."
 )
 
 
@@ -547,6 +551,7 @@ class CSVPlotViewer(QMainWindow):
         self.raw_search_matches = []
         self.pinned_results = {} # (file_path, timestamp, series) -> dict of pinned info
         self.current_search_index = -1
+        self.mcp_highlights = []  # LinearRegionItems the MCP layer drew (highlight_range)
 
         self._init_ui()
         self._create_menu()
@@ -788,6 +793,7 @@ class CSVPlotViewer(QMainWindow):
 
         tz_menu = menubar.addMenu("Timezone")
         tz_group = QActionGroup(self)
+        self.tz_group = tz_group
         for i in range(12):
             act = tz_group.addAction(f"UTC-{12-i}")
             act.setCheckable(True)
@@ -880,6 +886,7 @@ class CSVPlotViewer(QMainWindow):
     <li>啟動時即於 <b>127.0.0.1:8790</b> 開啟 MCP 端點，讓外部 agent 直接操作此視窗；<b>--mcp-port PORT</b> 可換埠，<b>--mcp-port 0</b> 可關閉。</li>
     <li>端點 URL: <b>http://127.0.0.1:PORT/mcp</b>；可用 <b>--mcp-token</b> 或環境變數 <b>LOGPLOT_MCP_TOKEN</b> 要求 Bearer 驗證。</li>
     <li>連線資訊同時寫在 <b>{MCP_DISCOVERY_PATH}</b>。</li>
+    <li>讀取工具外另有視圖工具可直接操作此視窗：<b>plot_series</b> / <b>unplot_series</b>（勾選/取消曲線）、<b>compute_series</b>（微分/絕對值）、<b>zoom_to</b>（移動時間窗）、<b>highlight_range</b>（畫出時間區間）、<b>measure_delta</b>（量測兩點時差）、<b>set_timezone</b>（換時區）、<b>search_text</b>（驅動下方搜尋）、<b>get_view_range</b>（讀目前視窗）、<b>screenshot_plot</b>（截圖）。</li>
 </ul>
         """
         QMessageBox.about(self, "LogPlot Usage", help_text)
@@ -1553,6 +1560,7 @@ class CSVPlotViewer(QMainWindow):
 
         file_item.insertRow(insert_row_idx, [self.series[new_key].column_item, self.series[new_key].value_item])
         self.series[new_key].column_item.setCheckState(Qt.Checked)
+        return new_col_name
 
     def adjust_curve_position_scale(self, item):
         ss: SeriesState = item.data()
@@ -1963,6 +1971,22 @@ class CSVPlotViewer(QMainWindow):
         self.measure_label.setPos((pos1 + pos2)/2, y_min)
         self.measure_text1.setPos(pos1, y_min)
         self.measure_text2.setPos(pos2, y_min)
+
+    def set_highlight_regions(self, ranges):
+        """Replace the agent-drawn time bands (MCP highlight_range) with the given ones."""
+        vb = self.mouse_vb
+        for region in self.mcp_highlights:
+            vb.removeItem(region)
+        self.mcp_highlights = []
+        for t1, t2 in ranges:
+            region = pg.LinearRegionItem()
+            region.setRegion((t1, t2))
+            region.setBrush(pg.mkBrush(255, 165, 0, 40))
+            region.setMovable(False)
+            region.setZValue(-100)
+            vb.addItem(region, ignoreBounds=True)
+            self.mcp_highlights.append(region)
+
 
     # --- 全局搜索與表格功能方法 ---
 
@@ -2744,6 +2768,180 @@ class McpBridge(QObject):
             self._tool_find_text,
         )
 
+        self._add_tool(
+            "get_view_range",
+            "The time and value range the user is currently looking at, from the main plot "
+            "and from the enum lanes on the right axis. Unix seconds.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self._tool_get_view_range,
+        )
+        self._add_tool(
+            "zoom_to",
+            "Move the plot to the window [t1, t2] so the user looks at it. Unix seconds or "
+            "ISO 8601. When curves are plotted on the main axis, the y range follows them "
+            "inside the window; the enum lanes on the right axis keep their own range.",
+            {
+                "type": "object",
+                "properties": {
+                    "t1": {"type": ["number", "string"],
+                           "description": "Window start: Unix seconds, or an ISO 8601 timestamp."},
+                    "t2": {"type": ["number", "string"],
+                           "description": "Window end (inclusive), same formats as t1."},
+                },
+                "required": ["t1", "t2"],
+                "additionalProperties": False,
+            },
+            self._tool_zoom_to,
+        )
+        self._add_tool(
+            "highlight_range",
+            "Draw shaded time bands on the plot so the user can see where you found "
+            "something. Each range is [t1, t2] in Unix seconds or ISO 8601; the bands "
+            "replace the ones an earlier call drew.",
+            {
+                "type": "object",
+                "properties": {
+                    "ranges": {
+                        "type": "array",
+                        "items": {"type": "array", "items": {"type": ["number", "string"]}},
+                        "description": "The time bands to draw, each [t1, t2].",
+                    },
+                },
+                "required": ["ranges"],
+                "additionalProperties": False,
+            },
+            self._tool_highlight_range,
+        )
+        self._add_tool(
+            "measure_delta",
+            "Place the viewer's two measure lines at t1 and t2, so the user sees the delta "
+            "between them labelled on the plot. This enables the measurement mode (the F2 "
+            "state) and reports that in the reply; the lines stay where they are put even "
+            "outside the current view.",
+            {
+                "type": "object",
+                "properties": {
+                    "t1": {"type": ["number", "string"],
+                           "description": "First line: Unix seconds, or an ISO 8601 timestamp."},
+                    "t2": {"type": ["number", "string"],
+                           "description": "Second line (inclusive), same formats as t1."},
+                },
+                "required": ["t1", "t2"],
+                "additionalProperties": False,
+            },
+            self._tool_measure_delta,
+        )
+        self._add_tool(
+            "set_timezone",
+            "Change the timezone the plot and all timestamps are displayed in, in whole "
+            "hours east of UTC. The reply -- and every later window reply -- carries the "
+            "resulting offset in 'tz'.",
+            {
+                "type": "object",
+                "properties": {
+                    "offset": {"type": "integer",
+                               "description": "Whole hours east of UTC, from -12 to +12."},
+                },
+                "required": ["offset"],
+                "additionalProperties": False,
+            },
+            self._tool_set_timezone,
+        )
+        self._add_tool(
+            "screenshot_plot",
+            "A PNG screenshot of the plot area as the user sees it right now. Returns image "
+            "content; only useful to models that can read images.",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            self._tool_screenshot_plot,
+        )
+        self._add_tool(
+            "plot_series",
+            "Check series in the viewer: numeric and enum series get their curve drawn, "
+            "free-text series are tracked in the value table and search. With 'file' "
+            "omitted this applies to every loaded file that has the column. The reply says "
+            "what each ended up as: plotted, tracked, already active, or absent.",
+            {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string",
+                             "description": "One loaded file, by path or unique basename. "
+                                            "Omit to apply to every loaded file."},
+                    "column": {"type": "string",
+                               "description": "One signal name (see list_series)."},
+                    "columns": {"type": "array", "items": {"type": "string"},
+                                "description": "Several signal names at once; give this or "
+                                               "'column', not both."},
+                },
+                "additionalProperties": False,
+            },
+            self._tool_plot_series,
+        )
+        self._add_tool(
+            "unplot_series",
+            "Uncheck series in the viewer: their curves are removed, and free-text series "
+            "stop being tracked. With 'file' omitted this applies to every loaded file. "
+            "The reply says what each ended up as.",
+            {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string",
+                             "description": "One loaded file, by path or unique basename. "
+                                            "Omit to apply to every loaded file."},
+                    "column": {"type": "string",
+                               "description": "One signal name (see list_series)."},
+                    "columns": {"type": "array", "items": {"type": "string"},
+                                "description": "Several signal names at once; give this or "
+                                               "'column', not both."},
+                },
+                "additionalProperties": False,
+            },
+            self._tool_unplot_series,
+        )
+        self._add_tool(
+            "compute_series",
+            "Derive a new signal from a numeric one, the way the right-click menu does: "
+            "first derivative ('1nd'), second derivative ('2nd') or absolute value ('abs'). "
+            "The new series is checked and drawn immediately; the reply names it.",
+            {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string",
+                             "description": "Loaded file, by path or unique basename. "
+                                            "May be omitted while exactly one file is "
+                                            "loaded."},
+                    "column": {"type": "string",
+                               "description": "The numeric signal to derive from."},
+                    "mode": {"type": "string",
+                             "description": "'1nd', '2nd' or 'abs'."},
+                },
+                "required": ["column", "mode"],
+                "additionalProperties": False,
+            },
+            self._tool_compute_series,
+        )
+        self._add_tool(
+            "search_text",
+            "Run the viewer's own bottom-panel search over the checked free-text series, "
+            "the way a human would type it and press Enter: the results appear in the "
+            "table for the user and the crosshair jumps to the first hit. 'q' is a "
+            "regular expression compared without regard to case. Unlike find_text, this "
+            "drives the GUI instead of only computing.",
+            {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string",
+                          "description": "Search text, a regular expression."},
+                    "limit": {"type": "integer",
+                              "description": f"Max hits returned, default {MCP_MAX_TEXT_MATCHES}."},
+                    "time_format": {"type": "string",
+                                    "description": "'unix' (default) or 'iso' for the hit times."},
+                },
+                "required": ["q"],
+                "additionalProperties": False,
+            },
+            self._tool_search_text,
+        )
+
     # --- tools ---
 
     def _describe_file(self, path, df):
@@ -2995,8 +3193,8 @@ class McpBridge(QObject):
             out["unchanged_truncated"] = len(still) > limit
         return out
 
-    def _tool_get_window(self, args):
-        path = self._resolve_file(args.get("file"), allow_default=True)
+    def _column_names(self, args):
+        """'column' or 'columns', validated once; shared by get_window and the plot tools."""
         requested = args.get("columns")
         if requested is not None:
             if args.get("column") is not None:
@@ -3004,12 +3202,15 @@ class McpBridge(QObject):
             if (not isinstance(requested, list) or not requested
                     or not all(isinstance(name, str) and name for name in requested)):
                 raise ValueError("'columns' must be a non-empty list of signal names")
-            names = requested
-        else:
-            name = args.get("column")
-            if not isinstance(name, str) or not name:
-                raise ValueError("'column' must be a non-empty string, or pass 'columns'")
-            names = [name]
+            return requested
+        name = args.get("column")
+        if not isinstance(name, str) or not name:
+            raise ValueError("'column' must be a non-empty string, or pass 'columns'")
+        return [name]
+
+    def _tool_get_window(self, args):
+        path = self._resolve_file(args.get("file"), allow_default=True)
+        names = self._column_names(args)
 
         t1, t2 = self._window_args(args)
         fmt, _tz = self._time_formatter(args)
@@ -3023,7 +3224,7 @@ class McpBridge(QObject):
         replies = [self._window_one(path, df, name, t1, t2, fmt, opts) for name in names]
         envelope = {"file": path, "t1": fmt(t1), "t2": fmt(t2),
                     "tz": _offset_text(self.viewer.x_axis.utcOffset)}
-        if requested is None:
+        if args.get("columns") is None:
             return {**envelope, **replies[0]}
         return {**envelope, "columns": replies}
 
@@ -3425,6 +3626,197 @@ class McpBridge(QObject):
             out["not_searched"] = not_searched
         return out
 
+    # --- view and plot control (Phase 3 / M4) ---
+    # These tools change what the human user sees. They run on the GUI thread like the
+    # read tools, and they answer with the state they left the viewer in.
+
+    def _tool_get_view_range(self, args):
+        main_x, main_y = self.viewer.main_vb.viewRange()
+        right_x, right_y = self.viewer.second_vb.viewRange()
+        return {
+            "main": {"x": [float(main_x[0]), float(main_x[1])],
+                     "y": [float(main_y[0]), float(main_y[1])]},
+            "right": {"x": [float(right_x[0]), float(right_x[1])],
+                      "y": [float(right_y[0]), float(right_y[1])]},
+            "tz": _offset_text(self.viewer.x_axis.utcOffset),
+        }
+
+    def _tool_zoom_to(self, args):
+        t1, t2 = self._window_args(args)
+        main = self.viewer.main_vb
+        main.setXRange(t1, t2, padding=0)
+        out = {"x": [t1, t2]}
+        lo, hi = self._visible_y_range(t1, t2)
+        if lo is not None:
+            main.setYRange(lo, hi, padding=0)
+            out["y"] = [lo, hi]
+        return out
+
+    def _visible_y_range(self, t1, t2):
+        """The y range of the curves drawn on the main axis inside [t1, t2], or None.
+
+        Values are the adjusted ones the curve actually shows, so the zoomed view matches
+        what is on screen.
+        """
+        lo, hi = None, None
+        for ss in self.viewer.series.values():
+            if not ss.is_active or ss.vb is not self.viewer.main_vb:
+                continue
+            if type(ss.series_data) == np.ndarray:
+                values = ss.series_data
+            else:
+                values = ss.series_data.to_numpy(dtype=float)
+            ts = ss.timestamps
+            start = int(np.searchsorted(ts, t1, side="left"))
+            stop = int(np.searchsorted(ts, t2, side="right"))
+            if start >= stop:
+                continue
+            y_offset, y_scale = ss.adjustment
+            base = ss.curve.base_val
+            segment = (values[start:stop] - base) * y_scale + base + y_offset
+            segment = segment[~np.isnan(segment)]
+            if len(segment) == 0:
+                continue
+            seg_lo, seg_hi = float(segment.min()), float(segment.max())
+            lo = seg_lo if lo is None else min(lo, seg_lo)
+            hi = seg_hi if hi is None else max(hi, seg_hi)
+        if lo is None:
+            return None, None
+        if hi - lo < 1e-9:          # a flat curve: give the axis some room
+            lo, hi = lo - 1.0, hi + 1.0
+        return lo, hi
+
+    def _tool_highlight_range(self, args):
+        raw = args.get("ranges")
+        if raw is None or not isinstance(raw, list) or not raw:
+            raise ValueError("'ranges' must be a non-empty list of [t1, t2] pairs")
+        if len(raw) > 64:
+            raise ValueError("'ranges' accepts at most 64 bands at once")
+        ranges = []
+        for i, pair in enumerate(raw):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(f"ranges[{i}] must be a [t1, t2] pair")
+            a = self._window_time(pair[0], f"ranges[{i}][0]")
+            b = self._window_time(pair[1], f"ranges[{i}][1]")
+            if a > b:
+                raise ValueError(f"ranges[{i}] start ({a}) must be <= end ({b})")
+            ranges.append((a, b))
+        self.viewer.set_highlight_regions(ranges)
+        return {"ranges": [[a, b] for a, b in ranges]}
+
+    def _tool_measure_delta(self, args):
+        t1, t2 = self._window_args(args)
+        viewer = self.viewer
+        was_enabled = viewer.measure_mode
+        viewer.toggle_measure_mode(True)    # may reposition the lines; the calls below win
+        viewer.measure_line1.setValue(t1)
+        viewer.measure_line2.setValue(t2)
+        viewer.update_measure_label()
+        return {"t1": t1, "t2": t2, "delta_s": t2 - t1,
+                "measure_mode": True, "was_enabled": was_enabled}
+
+    def _tool_set_timezone(self, args):
+        offset = args.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not -12 <= offset <= 12:
+            raise ValueError("'offset' must be a whole number of hours east of UTC, -12 to +12")
+        viewer = self.viewer
+        viewer.set_timezone_offset(offset)
+        for action in viewer.tz_group.actions():
+            if action.data() == offset:
+                action.setChecked(True)
+                break
+        return {"offset": offset, "tz": _offset_text(viewer.x_axis.utcOffset)}
+
+    def _tool_screenshot_plot(self, args):
+        pixmap = self.viewer.plot_widget.grab()
+        image = pixmap.toImage()
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            raise RuntimeError("could not encode the screenshot as PNG")
+        data = base64.b64encode(bytes(buffer.data())).decode("ascii")
+        return {"content": [{"type": "image", "mimeType": "image/png", "data": data}]}
+
+    def _tool_plot_series(self, args):
+        return self._set_plot_state(args, plot=True)
+
+    def _tool_unplot_series(self, args):
+        return self._set_plot_state(args, plot=False)
+
+    def _set_plot_state(self, args, plot):
+        names = self._column_names(args)
+        file_arg = args.get("file")
+        if file_arg is None or file_arg == "":
+            targets = list(self.viewer.dataframes)
+        else:
+            targets = [self._resolve_file(file_arg)]
+
+        results = []
+        for path in targets:
+            for name in names:
+                ss = self.viewer.series.get((path, name))
+                if ss is None:
+                    results.append({"file": path, "column": name, "status": "absent"})
+                    continue
+                was_checked = ss.column_item.checkState() == Qt.Checked
+                was_tracked = (path, name) in self.viewer.active_text_series
+                if plot and not was_checked:
+                    ss.column_item.setCheckState(Qt.Checked)      # fires on_item_changed
+                    status = "tracked" if ss.kind == "text" else "plotted"
+                elif not plot and was_checked:
+                    ss.column_item.setCheckState(Qt.Unchecked)    # fires on_item_changed
+                    status = "untracked" if was_tracked else "unplotted"
+                elif plot:
+                    status = "already_tracked" if (was_tracked or ss.kind == "text") \
+                        else "already_plotted"
+                else:
+                    status = "already_unplotted"
+                results.append({"file": path, "column": name, "status": status})
+        return {"columns": results}
+
+    def _tool_compute_series(self, args):
+        name = args.get("column")
+        if not isinstance(name, str) or not name:
+            raise ValueError("'column' must be a non-empty string")
+        mode = args.get("mode")
+        if mode not in ("1nd", "2nd", "abs"):
+            raise ValueError("'mode' must be '1nd', '2nd' or 'abs'")
+        path = self._resolve_file(args.get("file"), allow_default=True)
+        ss = self.viewer.series.get((path, name))
+        if ss is None:
+            raise ValueError(f"unknown column {name!r}; call list_series for the names")
+        if ss.is_string_type:
+            op = "the absolute value" if mode == "abs" else "the derivative"
+            raise ValueError(f"cannot calculate {op} of a string series ({name!r})")
+        # The menu path pops a modal for a string series; the tool must fail fast instead.
+        new_column = self.viewer.create_computed_series(ss.column_item, mode)
+        return {"file": path, "column": new_column, "mode": mode}
+
+    def _tool_search_text(self, args):
+        q = args.get("q")
+        if not isinstance(q, str) or not q:
+            raise ValueError("'q' must be a non-empty string")
+        viewer = self.viewer
+        if not viewer.active_text_series:
+            raise ValueError(
+                "no free-text series is checked, so the viewer has nothing to search; "
+                "plot a string series first (plot_series) -- list_series shows which ones "
+                "have kind 'text'")
+        viewer.search_input.setText(q)
+        try:
+            viewer.search_global_text()
+        except re.error as exc:
+            raise ValueError(f"'q' is not a valid regular expression: {exc}")
+        fmt, _tz = self._time_formatter(args)
+        limit = self._positive_int(args.get("limit", MCP_MAX_TEXT_MATCHES), "limit")
+        matches = viewer.raw_search_matches
+        shown = [[fmt(m["timestamp"] / 1e9), m["file"], m["series"], m["value"]]
+                 for m in matches[:limit]]
+        return {"q": q, "matches_found": len(matches), "matches": shown,
+                "truncated": len(matches) > limit,
+                "tz": _offset_text(viewer.x_axis.utcOffset)}
+
+
 
 class _McpHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -3509,6 +3901,9 @@ class McpHttpServer:
             result = self.bridge.call(name, arguments)
         except Exception as exc:
             return self._tool_error(str(exc))
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            # A tool may answer with ready-made MCP content (e.g. a screenshot image).
+            return {"content": result["content"], "isError": False}
         return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}],
                 "isError": False}
 

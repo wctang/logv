@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案）；M4（W9 GUI 操作）與 M5（跨檔 / fleet 層，來自第三輪評價）已成文，見「下一步規劃」。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案）。**M4 完成**（2026-10-12：W9 GUI 操作十工具，契約測試 219 項）。M5（跨檔 / fleet 層，來自第三輪評價）已成文，見「下一步規劃」。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -429,12 +429,57 @@ flowchart LR
 - **待決策：M4 與 M5 的順序。** 預設 M4 先：已承諾的下一里程碑、範圍小、不影響既有回覆契約，且其驗收（異常點框在使用者眼前）直接補剛完成的 fleet 分析。若跨檔查詢是當前日常主流程，M5-F1 可提前——F1a 單獨就消掉 18 次機械重覆呼叫，且不阻塞 F1b。
 - `mcp_test.py` 隨每個里程碑擴充；每段可獨立 smoke test，不必等全鏈路。
 
+## M4 完成紀錄（2026-10-12）
+
+W9 已實作：十個 GUI 操作工具全部上線，契約測試自 169 項擴充到 **219 項**（同一支 `mcp_test.py`，對部署環境 3.13.3 冷啟動實測全過）。
+
+### 新工具
+
+| 工具 | 接到哪裡 | 回應 / 回讀 |
+|---|---|---|
+| `get_view_range` | `main_vb.viewRange()` | `main` + `right` 的 x / y + `tz` |
+| `zoom_to(t1, t2)` | `main_vb.setXRange` | `x` 恆回；主軸有曲線時 `y` 由窗內調整後值算出（nanmin / nanmax，平坦曲線加 ±1）；右軸 enum 車道保持自範圍 |
+| `highlight_range(ranges)` | 新 `LinearRegionItem`，加進 `mouse_vb` 覆蓋層 | 最多 64 段，一次取代先前標記；回 `ranges` |
+| `measure_delta(t1, t2)` | `measure_line{1,2}.setValue` + `toggle_measure_mode(True)` | `delta_s` 精確；明報 `measure_mode: true` 與 `was_enabled` |
+| `set_timezone(offset)` | `set_timezone_offset` + `tz_group` 打勾（-12 到 +12） | `tz` 即回讀；各窗回應隨之改變 |
+| `screenshot_plot` | `plot_widget.grab()` → PNG | MCP image content（透傳約定） |
+| `plot_series(file?, column, columns?)` | `setCheckState(Checked)` → `on_item_changed` | 逐檔逐欄 `plotted` / `tracked` / `already_*` / `absent`；`file` 省略時套用到所有已載入檔 |
+| `unplot_series(...)` | `setCheckState(Unchecked)` | `unplotted` / `untracked` / `already_unplotted` / `absent` |
+| `compute_series(file?, column, mode)` | `create_computed_series`（改為回傳新欄名） | `1nd` / `2nd` / `abs`；新欄自動勾選並畫出；**字串欄先回錯，避免 modal 卡死** |
+| `search_text(q, limit?, time_format?)` | `search_input.setText` + `search_global_text()` | `matches_found` / `matches`（`[t, file, column, value]`，時間序）/ `truncated`；需至少一個已勾選文字系列，否則回錯並給修法；`q` 是 regex |
+
+### 實作要點
+
+- **協定層**：`_call_tool` 現在讓工具回傳含 `content`（預組好的 MCP content 清單）的 dict 原樣透傳——`screenshot_plot` 的 image 走這條；其餘工具回覆不變。
+- `zoom_to` 的 y 範圍由**曲線實際畫出的調整後值**（含 `adjustment` 與 `base_val`）計算，縮放後的視窗與畫面一致；字串 enum 曲線在 `second_vb`，不參與主軸 y。
+- 高亮帶 `setMovable(False)` 不可互動，加進 `mouse_vb`（x / y 已 link 到 `main_vb`）：不影響 autoRange、跟隨視窗。pyqtgraph 0.13.7 沒有 `LinearRegionItem.setOpts` / `setPen`，用 `setBrush` + `setMovable`。
+- `create_computed_series` 改為回傳新欄名（選單路徑忽略回傳值，行為不變）；工具端先查 `is_string_type`——原方法對字串欄會開 `QMessageBox` modal，工具直呼會卡到 60 s 逾時。
+- `column` / `columns` 參數驗證抽成 `_column_names`，`get_window` 與 plot 工具共用（行為與錯誤訊息不變）。
+- `search_text` 與 `find_text` 分工：前者驅動 GUI 下方搜尋表（人看見結果、十字線跳首筆），後者純查詢。
+
+### 驗證
+
+- 契約測試 `mcp_test.py`：**219/219**（冷啟動、真 GUI + 真 `.zst`，全程 HTTP）。
+- 舊 169 項全數照過（含 `get_window` 改用 `_column_names` 後單檔回覆逐位元不變）。
+- 回讀鏈：`zoom_to` → `get_view_range` 的 x 相符；`plot_series` → `list_series.plotted` 含之、`unplot` 後消失；`plot(text)` → `text_tracked` 含之；`compute_series` → `mpc_ctrl_t_play_abs` / `_1nd` 進 `list_series` 且 `get_window` 讀得到；`set_timezone(0)` → 各窗回應 `tz: "+00:00"`，還原後與原偏移一致。
+- `search_text("halt")` 在 msg 檔命中 **37** 筆，與 W6' 段 `find_text` 的獨立計數（pandas 交叉驗證）完全相符；`limit=5` 截 5 筆但 `matches_found` 仍 37。
+- fleet：`plot_series(column=mpc_ctrl_t_play)` 省略 `file` 時畫到含該欄的 2 檔、其餘 3 檔回 `absent` 而不報錯。
+- `screenshot_plot` 回 26.9 KB PNG（magic 驗證）；**視覺確認**：`highlight_range` 的橘色帶、`measure_delta` 兩條黃虛線與 `Δt: 600.000000 s` 標籤、縮放後的視窗（23:02–23:11）與平坦曲線皆如預期渲染。
+- 錯誤路徑：反向窗、空 / 畸形 / 倒轉的 band、>64 段、boolean 與越界 offset、壞 regex、字串欄微分——全部明確回錯、無 modal。
+
+### 觀察
+
+- `measure_delta` 會改動使用者的 F2 狀態（回應明報 `measure_mode: true`）；`zoom_to` / `highlight_range` / `plot_series` 改變使用者眼前的畫面——這是 M4 的目的，schema 描述已明說。
+- `search_text` 的 `q` 走 pandas `str.contains`（預設 regex），沒有 `find_text` 的四道 ReDoS 防護；比對範圍只有已勾選的文字系列，規模小得多，但呼叫端仍應避免病態 pattern。
+- 首輪測試暴露一個測試端問題：fleet 檢查時該欄若已畫會回 `already_plotted` 而非 `plotted`，斷言已改為兩者皆接受。
+
+
 ## 待辦
 
 - [x] **M1 — 低風險（2026-10-12 完成）**：W7 家務／語意修正、W8 背壓、W10 載入透明度、W11 契約測試
 - [x] **M2 — 分析層主力（2026-10-12 完成）**：W4 `mode="summary"`、W1 `list_series detail`
 - [x] **M3 — 覆議後動工（2026-10-12 完成）**：W6' `find_text`（開放 regex）、W3 多欄與快照（覆蓋舊決議）、W5 `mode="aggregate"`
-- [ ] **M4 — Phase 3 UI 操作**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
+- [x] **M4 — Phase 3 UI 操作（2026-10-12 完成）**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
 - [ ] **M5 — 跨檔（fleet）層（第三輪評價新增，2026-10-12 成文）**：F1 `get_window` 多檔 + 跨檔聚類、F2 `list_series` schema 去重、F5 enum 值清單、F4 跨檔 `kind` 一致性、F3 流程文件
 
 每階段可獨立 smoke test，不必等全鏈路完成；W11 契約測試隨任一段一起跑。
