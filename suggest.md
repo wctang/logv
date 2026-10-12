@@ -292,27 +292,27 @@ MCP 與 CLI 不是替代關係而是分工：MCP 是有狀態的 GUI 遙控器�
 
 ### 與第二輪建議的對照
 
-| 第二輪建議 | 現況 |
+| 第二輪建議 | 現況（2026-10-12，M5 後更新） |
 |---|---|
 | `summary` / `group_by` 依結局分組 | ✅ 已實作，本輪發現階段主力 |
 | 單點取值 `t1 == t2` / `snapshot` | ✅ 已實作（本輪未用） |
 | `aggregate` 區間彙總 | ✅ 已實作（本輪未用） |
 | `get_window(columns=[...])` 多欄同讀 | ✅ 已實作，已使用 |
-| 重複訊號 `duplicate_of` | ❌ 仍未見 |
-| `kind` 誤標 | ❌ 仍在，且本輪新增「同訊號名跨檔 kind 不同」案例 |
-| enum 附 `labels` 碼表 | ❌ 仍缺（此 log 集 `mpc_ctrl_mode` 直出字串，症狀性緩解；`mpc_ctrl_state` 仍是數值碼 0/1/4/5/6/7/8/9/10/14，未解碼） |
-| `alarm_data` 結構化 | ❌ 仍為拼接字串（值分布發現可用，因果先後仍不可讀） |
-| `plot` / `highlight` 引導 viewer | ❌ 仍無（工具仍為 6 個，無 plot/zoom/highlight） |
+| 重複訊號 `duplicate_of` | ✅ M2 已實作（`list_series detail=true`：`duplicate_of` / `same_timing_as` / `value_pairs`）；M5 基線測試在案例 C 九檔重確認（`t_elapsed` 為 `t_play` 的 duplicate） |
+| `kind` 誤標 | ⚠️ 單檔 kind 仍是 per-file 門檻設計（未變）；跨檔不一致自 M5-F4 起以頂層 `kind_conflicts: {name: {kind: [files]}}` 明示（只報不統一） |
+| enum 附 `labels` 碼表 | ⚠️ 語義 `labels` 依決策仍不內建（伺服器不帶語意）；M5-F5 對 enum 系列附 `values` 相異值清單——`GWD` 型值在進 segments 前即可於 `list_series` 對照 |
+| `alarm_data` 結構化 | ❌ 仍為拼接字串（決策：不內建內容文法解析；`find_text` 為呼叫端替代路徑） |
+| `plot` / `highlight` 引導 viewer | ✅ M4 已實作（十個 GUI 操作工具：`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `measure_delta` / `set_timezone` / `search_text` / `get_view_range` / `compute_series` / `screenshot_plot`） |
 
 ### 改進建議（本輪新增）
 
-| 痛點 | 建議 |
+| 痛點 | 建議 → 結案（M5，2026-10-12） |
 |---|---|
-| 無跨檔查詢 | `get_window` 的 `file` 在多檔載入時可省略 → 回 per-file entries；或增 `fleet` 模式：給訊號 + 偏差條件（如 `drop_dominant`），回「值 × 時段 × 涉及文件清單」聚類行，直接回答「幾個節點同時」 |
-| `list_series` 多檔爆量 | `list_series` 加 `file` 參數只列單檔；全部 schema 相同時回首份清單 + `same_as: [...]` |
-| `find_text` 對密集訊號不足 | 加可選 `mode: segments`（或 per-file 完整 change list），讓它成為發現→細節的一站式工具 |
-| `kind` 跨檔不一致 | 依訊號名跨所有載入檔統一計算 kind，或回 `kind_per_file` 明示 |
-| 未知 enum 值 | 第二輪已建議的 enum 附 `values` 相異值清單仍值得優先，讓 `GWD` 型值可對照碼表 |
+| 無跨檔查詢 | ✅ `get_window` 的 `file` 多檔時可省略 → `files` per-file entries；另增 `fleet=true`：run 依（值、起點 `tolerance_s` 內）跨檔聚類 → `{value, t_start, t_end, n_files, files}` 一行答「幾個節點同時」。案例 C 的 18 次機械重覆即此消解 |
+| `list_series` 多檔爆量 | ✅ `file` 參數（本已存在，現寫進 SKILL.md）只列單檔；各檔 schema 相同時回首份 + `same_as: [...]`。9 檔 × 206 欄由 50 KB+ 降為一份清單 + 8 個檔名 |
+| `find_text` 對密集訊號不足 | ✅ 採「不加參數」路線：多檔 `get_window`（F1a）已覆蓋落回 per-file 的細節步驟；「`find_text` 發現 → 多檔 `get_window` 細節」流程寫進 SKILL.md 與工具描述 |
+| `kind` 跨檔不一致 | ✅ 回 `kind_conflicts: {name: {kind: [files]}}` 明示（只報不統一——統一會改變 per-file 繪圖行為） |
+| 未知 enum 值 | ✅ enum 系列附 `values` 相異值清單（memo 進 `SeriesState`）；`GWD` 型值可於 `list_series` 對照，毋需先抓 segments |
 
 ### 一句話總結
 

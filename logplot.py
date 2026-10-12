@@ -66,6 +66,7 @@ MCP_MAX_TEXT_MATCHES = 50      # default cap on the hits find_text returns
 MCP_MAX_MATCHED_VALUES = 20    # cap on the distinct matched values find_text reports per series
 MCP_TEXT_SEARCH_TIMEOUT = 5.0  # wall-clock budget for one find_text call, against runaway patterns
 MCP_AGG_KINDS = ("min", "max", "first", "last")
+MCP_FLEET_TOLERANCE_S = 1.0    # runs within this many seconds of a cluster's start join it
 # The classic catastrophic-backtracking shapes, e.g. (a+)+: refused before they ever run.
 MCP_REGEX_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*][^)]*\)[+*]")
 MCP_MAX_PENDING_CALLS = 8      # more than this many calls queued for the GUI thread -> 'server busy'
@@ -79,7 +80,10 @@ MCP_INSTRUCTIONS = (
     "resolution available. Only the listed tools exist -- there is no shell, no file "
     "write and no way to remove data. A time window is answered with the change "
     "list when that fits, otherwise with a bounded summary; a raw million-row series is "
-    "never returned. The view tools (plot_series, unplot_series, compute_series, "
+    "never returned. Omitting 'file' with several files loaded reads every file in one "
+    "call, and get_window's fleet mode clusters a signal's runs across the files, so "
+    "'how many nodes did this at the same time' is a single question. The view tools "
+    "(plot_series, unplot_series, compute_series, "
     "zoom_to, highlight_range, measure_delta, set_timezone, search_text, screenshot_plot) "
     "change what the user sees on screen: use them to show the user your findings, "
     "not to compute."
@@ -97,6 +101,7 @@ class SeriesState:
         self.series_data_mapping = None
         self._kind = None                   # memoised by the kind / distinct_count properties
         self._distinct = None
+        self._enum_values = None            # memoised by the enum_values property
 
         self.display_name = self.column_name
         self.has_marker = False
@@ -146,6 +151,25 @@ class SeriesState:
         if self._kind is None:
             self._kind, self._distinct = self._classify()
         return self._distinct
+
+    @property
+    def enum_values(self):
+        """The column's distinct values as a list, or None when its kind is not 'enum'.
+
+        An enum holds few values by definition, so the whole set fits in a reply; this is
+        what lets a caller see a code table (e.g. a state name that only appears once)
+        before it ever reaches a window reply. Memoised like kind."""
+        if self.kind != "enum":
+            return None
+        if self._enum_values is None:
+            column = self.df[self.column_name]
+            if self.is_string_type:
+                self._enum_values = sorted(str(value) for value in column.dropna().unique())
+            else:
+                values = column.to_numpy(dtype=float)
+                self._enum_values = [_json_value(value)
+                                     for value in np.unique(values[~np.isnan(values)])]
+        return self._enum_values
 
     def _classify(self):
         """Count distinct values over the whole column and turn that into a kind."""
@@ -2499,6 +2523,44 @@ def _merge_equal_runs(times, values):
     return times[keep], values[keep]
 
 
+def _fleet_rows(runs_by_file, tolerance):
+    """Cluster a signal's runs across files: same value, starts within tolerance.
+
+    runs_by_file maps a file path to its list of (t_start, t_end, value) runs. The result
+    is (value, t_start, t_end, files) sorted by t_start, where a cluster's t_start is its
+    first run's start, its t_end the furthest end among its members, and files the paths
+    that contributed to it. A file contributes at most one run per cluster, because a run
+    is one value held between two changes and the tolerance walks forward from the anchor.
+    """
+    by_value = {}
+    for path, runs in runs_by_file.items():
+        for t_start, t_end, value in runs:
+            by_value.setdefault(str(_json_value(value)), []).append((t_start, t_end, path, value))
+    rows = []
+    for key, items in by_value.items():
+        items.sort(key=lambda item: (item[0], item[2]))
+        cluster = []
+        anchor = None
+        for t_start, t_end, path, value in items:
+            if anchor is not None and t_start > anchor + tolerance:
+                rows.append(_fleet_cluster(cluster))
+                cluster, anchor = [], None
+            if anchor is None:
+                anchor = t_start
+            cluster.append((t_start, t_end, path, value))
+        if cluster:
+            rows.append(_fleet_cluster(cluster))
+    rows.sort(key=lambda row: (row[1], str(row[0])))
+    return rows
+
+
+def _fleet_cluster(cluster):
+    """One cluster's row: the value, its first start, its furthest end and its files."""
+    files = sorted({path for _t, _e, path, _v in cluster})
+    return (cluster[0][3], cluster[0][0],
+            max(end for _t, end, _p, _v in cluster), files)
+
+
 class McpBridge(QObject):
     """Owns the tool table and runs every tool on the GUI thread."""
 
@@ -2602,7 +2664,12 @@ class McpBridge(QObject):
             "values), 'same_timing_as' (series that moved on exactly the same samples with "
             "different values) and 'value_pairs' (how the values of this series and one of "
             "those correspond, when that correspondence is one-to-one). Those facts are "
-            "structure only: nothing here claims to know what a value means.",
+            "structure only: nothing here claims to know what a value means. Each 'enum' name "
+            "also lists its distinct values under 'values', so a code table is visible before "
+            "any window is read. With several files loaded and omitting 'file', files sharing "
+            "one schema are listed once with the rest named under 'same_as'; names whose kind "
+            "differs across files are reported under 'kind_conflicts' ({kind: [files]}), which "
+            "is a report, not a correction.",
             {
                 "type": "object",
                 "properties": {
@@ -2670,13 +2737,21 @@ class McpBridge(QObject):
             "is left does not fit max_points the reply becomes a bounded summary (mode 'dense', "
             "with stats and a value distribution for low-cardinality signals); 'summary' and "
             "'aggregate' are already reductions, so there the budget caps their rows instead. A "
-            "window reaching past the last sample is clamped to it and flagged held_truncated.",
+            "window reaching past the last sample is clamped to it and flagged held_truncated. "
+            "Omitting 'file' with several files loaded reads every loaded file: the reply then "
+            "carries a 'files' list with one entry per file, and a file missing the column "
+            "carries an error entry instead of failing the call. With several files loaded, "
+            "fleet=true clusters the window's runs across files by value and start time "
+            "(tolerance_s, default 1 s): each fleet row names the value, its first start, its "
+            "furthest end and how many files show it -- the answer to 'did several nodes do "
+            "this at the same time'.",
             {
                 "type": "object",
                 "properties": {
                     "file": {"type": "string",
                              "description": "Loaded file, by path or unique basename (see list_files). "
-                                            "May be omitted while exactly one file is loaded."},
+                                            "Omit to read every loaded file: the reply then carries a "
+                                            "'files' list, one entry per file."},
                     "column": {"type": "string", "description": "One signal name (see list_series)."},
                     "columns": {
                         "type": "array",
@@ -2715,6 +2790,17 @@ class McpBridge(QObject):
                     "drop_dominant": {"type": "boolean",
                                       "description": "Only keep runs whose value is not the one "
                                                      "holding the most time (mode 'segments' only)."},
+                    "fleet": {"type": "boolean",
+                              "description": "Cluster this window's runs across the loaded files by "
+                                             "value and start time (needs several files and one "
+                                             "'column'; modes 'segments'/'transitions' only). The "
+                                             "reply gains a 'fleet' list of {value, t_start, t_end, "
+                                             "n_files, files} rows; max_points caps that list and "
+                                             "sets fleet_truncated."},
+                    "tolerance_s": {"type": "number",
+                                    "description": "With fleet=true, runs whose start is within this "
+                                                   "many seconds of a cluster's first start join it. "
+                                                   f"Default {MCP_FLEET_TOLERANCE_S}."},
                     "time_format": {"type": "string",
                                     "description": "'unix' (default) or 'iso' for the returned times."},
                 },
@@ -3035,10 +3121,10 @@ class McpBridge(QObject):
         else:
             targets = [self._resolve_file(requested)]
 
-        files = []
+        files, kinds_by_file = [], []
         for path in targets:
             df = self.viewer.dataframes[path]
-            numeric, strings, plotted, tracked, labels, kinds = [], [], [], [], {}, {}
+            numeric, strings, plotted, tracked, labels, kinds, values = [], [], [], [], {}, {}, {}
             facts = {}
             scan = self.viewer.file_scan(path) if detail else None
             relations = self.viewer.file_relations(path) if detail else {}
@@ -3067,6 +3153,9 @@ class McpBridge(QObject):
                 if ss is None:
                     continue
                 kinds[name] = ss.kind          # how the viewer draws it
+                enum_values = ss.enum_values   # None unless the kind is 'enum'
+                if enum_values:
+                    values[name] = enum_values
                 if ss.is_active:
                     plotted.append(name)
                 if (path, col) in self.viewer.active_text_series:
@@ -3088,10 +3177,32 @@ class McpBridge(QObject):
                 entry["labels"] = labels
             if kinds:
                 entry["kinds"] = kinds
+            if values:
+                entry["values"] = values
             if detail:
                 entry["facts"] = facts
             files.append(entry)
-        return {"files": files}
+            kinds_by_file.append(kinds)
+
+        out = {"files": files}
+        if len(targets) > 1:
+            # Where a name is drawn differently in different files, say so and for whom:
+            # report only -- the viewer draws each file its own way, so nothing unifies.
+            by_name = {}
+            for path, kinds in zip(targets, kinds_by_file):
+                for name, kind in kinds.items():
+                    by_name.setdefault(name, {}).setdefault(kind, []).append(path)
+            conflicts = {name: per for name, per in by_name.items() if len(per) > 1}
+            if conflicts:
+                out["kind_conflicts"] = conflicts
+            name_sets = [frozenset(map(str, self.viewer.dataframes[path].columns))
+                         for path in targets]
+            if all(same == name_sets[0] for same in name_sets[1:]):
+                # One schema, N files: list it once and name the rest, instead of
+                # returning N copies of the same 200 names.
+                out["files"] = files[:1]
+                out["same_as"] = targets[1:]
+        return out
 
     # --- time windows ---
     # One representation for both tools: a change list, [time, value] pairs where the value
@@ -3209,24 +3320,98 @@ class McpBridge(QObject):
         return [name]
 
     def _tool_get_window(self, args):
-        path = self._resolve_file(args.get("file"), allow_default=True)
+        """Read one or more signals over one window; 'file' omitted means every loaded file."""
         names = self._column_names(args)
-
         t1, t2 = self._window_args(args)
         fmt, _tz = self._time_formatter(args)
         opts = self._window_options(args, t1, t2)
 
-        df = self.viewer.dataframes[path]
-        for name in names:
-            if name not in df.columns:
-                raise ValueError(f"unknown column {name!r}; call list_series(file='{path}') for the names")
+        requested = args.get("file")
+        if requested is None or requested == "":
+            targets = list(self.viewer.dataframes)
+        elif not isinstance(requested, str):
+            raise ValueError("'file' must be a string")
+        else:
+            targets = [self._resolve_file(requested)]
+        tz = _offset_text(self.viewer.x_axis.utcOffset)
 
-        replies = [self._window_one(path, df, name, t1, t2, fmt, opts) for name in names]
-        envelope = {"file": path, "t1": fmt(t1), "t2": fmt(t2),
-                    "tz": _offset_text(self.viewer.x_axis.utcOffset)}
-        if args.get("columns") is None:
-            return {**envelope, **replies[0]}
-        return {**envelope, "columns": replies}
+        fleet = bool(args.get("fleet", False))
+        if fleet:
+            if len(targets) < 2:
+                raise ValueError("'fleet' needs at least two loaded files; "
+                                 "name one with 'file' for the single-file reply")
+            if len(names) != 1:
+                raise ValueError("'fleet' reads one signal at a time: pass 'column', not 'columns'")
+            if opts["mode"] not in ("segments", "transitions"):
+                raise ValueError("'fleet' applies to mode 'segments' and 'transitions' only")
+            tolerance = args.get("tolerance_s", MCP_FLEET_TOLERANCE_S)
+            if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                    or tolerance < 0):
+                raise ValueError("'tolerance_s' must be a non-negative number of seconds")
+        elif args.get("tolerance_s") is not None:
+            raise ValueError("'tolerance_s' only applies with fleet=true")
+
+        if len(targets) == 1:
+            # The single-file reply, in the exact shape it has always had.
+            path = targets[0]
+            df = self.viewer.dataframes[path]
+            for name in names:
+                if name not in df.columns:
+                    raise ValueError(f"unknown column {name!r}; call list_series(file='{path}') for the names")
+            replies = [self._window_one(path, df, name, t1, t2, fmt, opts) for name in names]
+            envelope = {"file": path, "t1": fmt(t1), "t2": fmt(t2), "tz": tz}
+            if args.get("columns") is None:
+                return {**envelope, **replies[0]}
+            return {**envelope, "columns": replies}
+
+        # Several files: one entry per file. A file missing a column carries an error
+        # entry instead of failing the whole call, so one odd file cannot hide the rest.
+        entries, runs_by_file = [], {}
+        for path in targets:
+            df = self.viewer.dataframes[path]
+            missing = [name for name in names if name not in df.columns]
+            if missing:
+                entries.append({"file": path, "error": (
+                    f"unknown column {missing[0]!r} in this file; "
+                    f"call list_series(file='{path}') for the names")})
+                continue
+            replies = [self._window_one(path, df, name, t1, t2, fmt, opts) for name in names]
+            entry = {"file": path, "t1": fmt(t1), "t2": fmt(t2), "tz": tz}
+            if args.get("columns") is None:
+                entry.update(replies[0])
+            else:
+                entry["columns"] = replies
+            entries.append(entry)
+            if fleet:
+                runs_by_file[path] = self._fleet_runs(df, names[0], t1, t2)
+
+        envelope = {"t1": fmt(t1), "t2": fmt(t2), "tz": tz, "files": entries}
+        if not fleet:
+            return envelope
+
+        rows = _fleet_rows(runs_by_file, tolerance)
+        out = dict(envelope)
+        out["fleet"] = [
+            {"value": value, "t_start": fmt(start), "t_end": fmt(end),
+             "n_files": len(files), "files": files}
+            for value, start, end, files in rows]
+        if len(out["fleet"]) > opts["max_points"]:
+            out["fleet_truncated"] = True
+            out["fleet"] = out["fleet"][:opts["max_points"]]
+        return out
+
+    def _fleet_runs(self, df, column, t1, t2):
+        """One column's runs in one window as (t_start, t_end, value), raw floats and values."""
+        start, stop = self._window_slice(df, t1, t2)
+        values = df[column].to_numpy()[start:stop]
+        if len(values) == 0:
+            return []
+        index = df.index.to_numpy()[start:stop]
+        starts = _segment_starts(values)
+        times = index[starts] / 1e9
+        window_end = min(t2, float(index[-1]) / 1e9)
+        ends = np.append(times[1:], window_end)
+        return list(zip(times.tolist(), ends.tolist(), values[starts].tolist()))
 
     def _window_options(self, args, t1, t2):
         """Validate the mode and its arguments once, for one column or for many."""

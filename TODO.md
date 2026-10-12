@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案）。**M4 完成**（2026-10-12：W9 GUI 操作十工具，契約測試 219 項）。M5（跨檔 / fleet 層，來自第三輪評價）已成文，見「下一步規劃」。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案）。**M4 完成**（2026-10-12：W9 GUI 操作十工具，契約測試 219 項）。**M5 完成**（2026-10-12：F1a/F1b 多檔 `get_window` 與跨檔聚類、F2 `list_series` schema 去重、F5 enum 值清單、F4 跨檔 `kind` 衝突回報、F3 流程文件；契約測試重訂基線到案例 C 九檔，286/286）。原計畫 M1–M5 全部完成。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -422,12 +422,12 @@ W3 / W5 / W6' 已實作（覆議點 1「覆蓋」、覆議點 3「開放」）�
 
 ```mermaid
 flowchart LR
-  M3["M3 ✅ 2026-10-12"] --> M4["M4（W9）GUI 操作"]
-  M4 --> M5["M5（F1–F5）跨檔層"]
+  M3["M3 ✅ 2026-10-12"] --> M4["M4 ✅（W9）GUI 操作"]
+  M4 --> M5["M5 ✅（F1–F5）跨檔層"]
 ```
 
-- **待決策：M4 與 M5 的順序。** 預設 M4 先：已承諾的下一里程碑、範圍小、不影響既有回覆契約，且其驗收（異常點框在使用者眼前）直接補剛完成的 fleet 分析。若跨檔查詢是當前日常主流程，M5-F1 可提前——F1a 單獨就消掉 18 次機械重覆呼叫，且不阻塞 F1b。
-- `mcp_test.py` 隨每個里程碑擴充；每段可獨立 smoke test，不必等全鏈路。
+- **M4 與 M5 的順序（已結案）**：M4 先行、M5 殿後，兩者皆於 2026-10-12 完成。F1a（多檔 `get_window`）與 F1b（跨檔聚類）如計畫先落地，是案例 C「21 次呼叫壓到 10 次以內」的主力。
+- `mcp_test.py` 隨每個里程碑擴充；M5 起基線改掛案例 C 的九檔（原五檔 fixture 被取代），每段仍可獨立 smoke test。
 
 ## M4 完成紀錄（2026-10-12）
 
@@ -474,13 +474,53 @@ W9 已實作：十個 GUI 操作工具全部上線，契約測試自 169 項擴�
 - 首輪測試暴露一個測試端問題：fleet 檢查時該欄若已畫會回 `already_plotted` 而非 `plotted`，斷言已改為兩者皆接受。
 
 
+## M5 完成紀錄（2026-10-12）
+
+F1–F5 已實作：跨檔（fleet）層上線，`mcp_test.py` 自 219 項**重訂基線**到案例 C 的九檔 fixture（原五檔被取代；`EXPECTED` 表記錄各檔的 columns/rows/採樣/最大間隙/常數數/整檔 `mpc_ctrl_mode` 段數），全數 **286/286**（冷啟動、真 GUI + 真 `.zst`，全程 HTTP）。
+
+### 新增介面
+
+| 工項 | 介面 | 實作位置 |
+|---|---|---|
+| F1a | `get_window` 多檔：多檔載入時 `file` 可省略 → 回覆 `t1`/`t2`/`tz` + `files: [{file, t1, t2, tz, …}]`，每檔項目與單檔回覆逐位元相同；某檔缺欄給該檔 `error` 項目、不中斷全呼叫 | `_tool_get_window` |
+| F1b | 跨檔聚類：`fleet=true`（僅多檔、單 `column`、`segments`/`transitions`）→ 各檔 run 依（值、起點落在 `tolerance_s` 內，預設 `MCP_FLEET_TOLERANCE_S = 1.0` s）聚類 → `fleet: [{value, t_start, t_end, n_files, files}]`，受 `max_points` 預算、超額標 `fleet_truncated` | `_fleet_rows` / `_fleet_cluster` / `_fleet_runs` |
+| F2 | `list_series` schema 去重：範圍內各檔欄位集合相同 → 只回首份 + 頂層 `same_as: [其餘檔]`；`file` 參數（:3029）本已存在，寫進 SKILL.md | `_tool_list_series` |
+| F5 | enum 值清單：kind=enum 系列附 `values: {name: […]}`（字串 enum distinct < 15、數值 enum < 3，門檻天然有界）；memo 進 `SeriesState.enum_values`（與 `kind`/`distinct_count` 同處） | `SeriesState.enum_values` |
+| F4 | 跨檔 `kind` 一致性：同一欄名跨檔 kind 不同 → 頂層 `kind_conflicts: {name: {kind: [files]}}`；**只報不統一** | `_tool_list_series` |
+| F3 | 流程文件：「`find_text` 發現 → 多檔 `get_window` / `fleet` 細節」與 `file` 省略慣例寫進 SKILL.md 與工具描述 | SKILL.md |
+
+### 實作要點
+
+- **多檔與 fleet 共用一個 `_tool_get_window`**：`file` 省略即「全部已載入檔」，與 `find_changes` / `find_text` 的既有慣例一致；單檔回覆走原路徑（逐位元不變，舊呼叫端零影響）。
+- **聚類是純函式**（`_fleet_rows`，不碰 GUI thread 狀態）：每個值內以「起點 ≤ 錨點 + tolerance」前向走聚類，一個檔對同一簇至多貢獻一個 run（run 是兩變之間的一段值）。`t_start` 取簇內最早、`t_end` 取簇內最遠、`files` 去重排序。
+- **`_fleet_runs` 取 run 值要落在段起點**（`values[starts]`），不是順序值——首輪測試的 halt 簇值被讀成前一值（`playing`），即此處 bug，已修。
+- F5 的 `values` 與 F2 的 `same_as` / F4 的 `kind_conflicts` 都只在多檔範圍（或 `detail` 外的每檔條目）出現，單檔回覆不變。
+
+### 驗證（案例 C 九檔，`log-20260928_mpc_ctrl_101…109.csv.zst`，各 206 欄同 schema）
+
+- **F1a**：一次呼叫回 9 檔 `mpc_ctrl_mode` 的 segments，每檔段數對上 `EXPECTED`；`per_file[101]` 與單檔呼叫 `==`（逐位元）；缺欄檔（合成 `fleet_other.csv`）回 `error` 項目、其餘檔照常答覆。
+- **F1b**：23:22:29–23:22:52 事件窗 → `playing` 與 `halt` 各一行、`n_files` 皆 9；`halt` 簇 `t_start` 對上實測 `1790608972.417`；A–G 七組中止事件一次呼叫全部可復現（各簇 `n_files` 3/3/3/3/9/7/8）；`max_points=5` 截到 5 行並標 `fleet_truncated`；`tolerance_s=0.0005`（小於九節點真實散布 ≈1.1 ms）把 halt 簇拆開。
+- **F2**：9 檔同 schema → 一份清單 + 8 個 `same_as` 檔名（遠低於現行 50 KB+）；指定單檔仍回完整清單、無 `same_as`。
+- **F5**：103 的 `mpc_ctrl_mode` 值清單含 `GWD`（進 segments 前就於 `list_series` 可見）；101 的 `mpc_ctrl_mode` 十值無 `GWD`；`alarm_data`（101，11 值）與數值 enum `mpc_ctrl_en_1`（`[0,1]`）皆附值；text 系列（107 的 `alarm_data`，17 值）不附。
+- **F4**：`kind_conflicts` 恰回 7 個衝突名（`alarm_data` + `servo_hour_1..6`）；`alarm_data` 為 107 text、其餘 8 檔 enum；非衝突名（`mpc_ctrl_mode`）不出現。
+- 舊 219 項對應行為（W7/W4/W1/W3/W5/W6'/M4/W8）全數照過，且改以案例 C 九檔為基線。
+
+### 觀察
+
+- **九節點的同一現場中止在 <2 ms 內各自記錄**：事件 E 的九檔 `halt` 起點散布僅 ≈1.1 ms，預設 `tolerance_s=1.0` 足以把九節點聚成一簇；要拆開需 `tolerance_s` 小於真實散布（測試用 0.0005）。這與 M2 順手發現「兩台控制器記錄同一現場事件差約 1 ms」一致。
+- **`list_series` 多檔首次呼叫**會觸發各檔每欄 distinct 計數（kind 分類），是九檔情境下的主要成本；之後 memo 化。`values`（F5）與 `distinct` 同源，不額外掃描。
+- **`fleet` 不支援 `summary`/`aggregate`/`snapshot`**：後兩者已是約化（reduction），跨檔約化語義未定義，明確回錯而非隱性降級。
+- **`tolerance_s` 無 `fleet` 時回錯**（`'tolerance_s' only applies with fleet=true`），避免誤以為它影響單檔 segments。
+
+
+
 ## 待辦
 
 - [x] **M1 — 低風險（2026-10-12 完成）**：W7 家務／語意修正、W8 背壓、W10 載入透明度、W11 契約測試
 - [x] **M2 — 分析層主力（2026-10-12 完成）**：W4 `mode="summary"`、W1 `list_series detail`
 - [x] **M3 — 覆議後動工（2026-10-12 完成）**：W6' `find_text`（開放 regex）、W3 多欄與快照（覆蓋舊決議）、W5 `mode="aggregate"`
 - [x] **M4 — Phase 3 UI 操作（2026-10-12 完成）**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
-- [ ] **M5 — 跨檔（fleet）層（第三輪評價新增，2026-10-12 成文）**：F1 `get_window` 多檔 + 跨檔聚類、F2 `list_series` schema 去重、F5 enum 值清單、F4 跨檔 `kind` 一致性、F3 流程文件
+- [x] **M5 — 跨檔（fleet）層（2026-10-12 完成）**：F1a `get_window` 多檔（`file` 可省略 → `files: [{file, …}]`，逐檔 error 不中斷）、F1b `fleet=true` 跨檔聚類（`{value, t_start, t_end, n_files, files}`）、F2 `list_series` schema 去重（`same_as`）、F5 enum 值清單（`values`）、F4 跨檔 `kind` 衝突（`kind_conflicts`，只報不統一）、F3 流程文件（SKILL.md + 工具描述）
 
 每階段可獨立 smoke test，不必等全鏈路完成；W11 契約測試隨任一段一起跑。
 
