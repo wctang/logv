@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案），只剩 M4。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案）；M4（W9 GUI 操作）與 M5（跨檔 / fleet 層，來自第三輪評價）已成文，見「下一步規劃」。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -20,6 +20,7 @@
 | `kind` 的角色 | **僅描述 viewer 怎麼畫**，不作為輸出策略的依據；不以基數自動重判 enum / code | `AI_W1`=〔0,1,16,17,256,272,273〕、`SVOHR1`=〔0,18615…18623〕與 `mpc_ctrl_state`=〔1,2,7,8,9,10,12〕結構上不可分 |
 | headless / stdio 模式 | **不做**（2026-10-08 決定） | 需求是驅動 GUI，不是無頭批次 |
 | omp 設定位置 | **用戶層 `~/.omp/agent/mcp.json`** | 任何 cwd 都生效；不動公開 repo 的檔案 |
+| agent 端接入方式 | **skill + `logplot_mcp.py` proxy（2026-10-12，覆蓋上一列的 MCP 設定）** | omp 的 MCP 客戶端整合沒有 lazy 連線，且未連上過的 HTTP server 不再被探測（GUI 沒開時工具不存在）；proxy 是 per-call、零依賴、跨 agent，且 server 端不必改（見「方案 1」） |
 | 已放棄路線 | UI 內建對話 agent（openai SDK + `QDockWidget` + 本機 llama.cpp） | 需在 UI 養對話框、管 key、加依賴；MCP 路線同樣能達到目的且零依賴 |
 
 ## 既有程式碼的硬限制
@@ -67,6 +68,8 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 ```
 
 `timeout` 用 120 s（預設 30 s 太短：載入大型 `.zst` 走 C engine 會超過 30 s），且必須大於 server 端 60 s 的 GUI 等待上限，才會由我們回報明確錯誤而不是 omp 端先斷線。
+
+**2026-10-12：這個條目已從用戶層 `mcp.json` 移除**（session 不再對它做啟動連線），agent 端改走下方「方案 1」的 skill + proxy；以上保留為歷史紀錄。
 
 ### 驗證紀錄
 
@@ -205,7 +208,7 @@ M1 低風險先落地；M2 是分析層主力（做完後 suggest.md 案例 B �
 ### 待覆議
 
 1. ~~W3 多欄快照與本檔「`get_value` 已決議不做」衝突~~ → **2026-10-12 覆蓋**：W3 的 `t1 == t2` snapshot 已實作，`get_at` 這條決議撤銷（見下方「不做」的註記）。
-2. **W9 是否提前** plot / zoom / highlight（suggest.md 兩輪都點名 `plotted` 唯讀是最大缺口）—— 仍待決，M4 暫照原計畫排在最後。
+2. **W9 是否提前** plot / zoom / highlight（suggest.md 兩輪都點名 `plotted` 唯讀是最大缺口）—— 仍待決，M4 暫照原計畫排在最後。→ 2026-10-12：M1–M3 全部完成，本項併入「下一步規劃」的 M4 / M5 順序決策（預設 M4 先做）。
 3. ~~W6' 是否開放具名群組的 regex~~ → **2026-10-12 開放**：`regex=true` 可用，代價是四道防護（pattern 長度上限 200、只對窗內去重後的值比對、逐值 try/except、5 s 總時限）加上巢狀量詞的啟發式拒絕；殘餘風險見 M3 完成紀錄。
 
 ### 不做（維持決議）
@@ -338,12 +341,101 @@ W3 / W5 / W6' 已實作（覆議點 1「覆蓋」、覆議點 3「開放」）�
 - `re` 沒有可中斷的比對，**單一值的災難性回溯仍然會卡住整通呼叫**（到 client 端逾時）。現有防護是：pattern 長度上限 200、巢狀量詞啟發式（`(a+)+` 這類形状直接拒收）、5 s 牆鐘預算在「多個值」層級逐 1024 個值檢查、逐值 try/except。要根治需要換成有時限的 regex 引擎，也就是加依賴，與「零新依賴」的決議衝突。**5 s 預算的路徑本身沒有被測試涵蓋**（要穩定觸發它得先有一個能繞過啟發式又會卡住的 pattern，那正是不能放進契約測試的東西）。
 - `find_text` 每欄最多取 `limit` 筆命中再全域排序取前 `limit` 筆，所以 `matches` 是**時間序的樣本**、不是全部；每欄的完整命中數在 `series[].count`。`truncated` 用「找到的筆數 > 列出的筆數」判定（初版寫成 `len(matches) > limit`，在單欄情況下永遠是 false，這一輪修掉）。
 
+## 方案 1：skill + proxy（2026-10-12 落地）
+
+**為什麼**：omp 的 MCP 連線發生在 session 啟動，沒有 lazy 模式（`cfg://mcp` 只有 `enableProjectConfig` / `notificationDebounceMs` / `notifications` / `renderMarkdownResults` / `startupTimeoutMs` 五個鍵）；而且**從未連上過的 HTTP server 不會被再探測**（15 s→5 min 的背景探測只給「曾連上後斷線」的 server）。結果是 GUI 沒開時 agent 連工具都看不到，且「先開 omp、後開 logplot」在同一 session 內永遠接不上（只能人工 `/mcp reload`／`/mcp reconnect`）。
+
+**形態**（server 端零改動）：
+
+| 檔案 | 角色 |
+|---|---|
+| `~/.agents/skills/logplot/SKILL.md` | 使用說明與流程。跨 agent 標準（agentskills.io）：`~/.agents/skills` 同時被 omp、Codex CLI、Gemini CLI、Claude Code 讀取 |
+| `~/.agents/skills/logplot/logplot_mcp.py` | stdlib-only per-call client：`status` / `tools [--full] [--name]` / `call <tool> [json\|@file]` / `batch`（stdin JSONL）/ `start [--load FILE]` |
+
+- 打的是同一個 `POST 127.0.0.1:8790/mcp`（`initialize` → `notifications/initialized` → `tools/list` / `tools/call`），所以 `mcp_test.py` 那 169 項驗證對這條路同樣有效；改的只是「誰當 client」。
+- 端點解析：`--url` / `$LOGPLOT_MCP_URL` → `%TEMP%\logplot-mcp.json` → `127.0.0.1:8790`；token 走 `--token` / `$LOGPLOT_MCP_TOKEN`（`start` 用環境變數傳給子行程，不進命令列）。
+- 用戶層 `mcp.json` 的 `logplot` 條目已移除。
+- 契約測試 `mcp_test.py` 完全不動：它本來就是打 HTTP 的獨立 client，也是這條路的最小實作樣板。
+
+**驗證紀錄**（部署環境 `D:\log_tools\runtime\python.exe` 3.13.3；port 8791 + `LOGPLOT_MCP_TOKEN=smoke-token`；全程真的 GUI、真的 `.zst`，不是模組內直呼函式）：
+
+- `start --load log-htb-…101.csv.zst`：**6.25 s** 內完成「啟動 GUI → 載入檔案 → 端點握手」；`status` 回 `reachable: true` 與 6 個工具名。
+- 資料與 M1/M2/M3 的既有數字逐項相符：101 檔 **337 010 列 × 125 欄 / constant_count 31**、105 檔 **328 746 列 × 125 欄**；`get_window(mpc_ctrl_mode, mode=transitions, time_format=iso)` 在 07:36:40–07:43:20 重現中止 A（`playing→halt` @ **07:37:20.308**，前一列 `ready→playing` 的 held **27.388927 s**）；`snapshot`（`t1 == t2`）一次讀到 4 條訊號（含當時仍為 `null` 的 `alarm_data`）。
+- `find_changes` 同窗回 71 有變 / 54 未變；`batch` 以**一個 process** 跑完 3 次呼叫；`tools --name get_window --full` 回 13 個屬性；`call … @args.json` 可從檔案讀參數。
+- 錯誤路徑：錯 token → **401**（`exit 1`）；未知工具 → `unknown tool: …`（`exit 1`）；壞 JSON → `arguments are not valid JSON`（`exit 1`）。
+- 強制終止 GUI（非正常關閉）→ `status` 回 `reachable: false` + `discovery_stale: true`（沿用 M1 的已知觀察：探索檔只在 `closeEvent` 刪除）；無探索檔時回退到 8790。
+- omp 端發現：`omp read skill://logplot` 解析成功（新 session 或 `/clear` 之後才會進系統提示的技能清單）。
+- 成本：proxy 每次呼叫起一個直譯器，實測 `json + urllib` 版 **143 ms**（`pass` 48 ms；對照同一台機器的 pandas 445 ms、PySide6 1 933 ms）。
+
+**已知限制**：
+
+- `start` 會新開一個 GUI；已有一個在跑時不要用（第二個實例是另一份狀態）。既有的 GUI 用 `call load_files` 加檔案。
+- 同一個 GUI 的 GUI thread 仍序列化，>8 個待處理呼叫回 `server busy`——與連線方式無關。
+- skill 只在 session 邊界被重讀（新 session 或 `/clear`），本 session 內新增的 skill 不會出現在系統提示裡。
+- M4（W9 GUI 操作）不受影響：proxy 一樣走 `tools/call`，新工具自動可見。
+
+## 下一步規劃（2026-10-12）
+
+依據：M1–M3 完成（契約測試 `mcp_test.py` 169/169），原計畫只剩 M4；第三輪評價（案例 C，9 檔 fleet）暴露跨檔缺口，新增 M5。行號為 2026-10-12 版 `logplot.py`，以方法名為準。
+
+### M4 — W9 GUI 操作（原計畫最後一項）
+
+十個工具全部走既有 `McpBridge` 在 GUI thread 執行，零架構改動。協定層唯一改動：`_call_tool`（:3499）現在一律把結果包成單一 text content（:3512），`screenshot_plot` 要回 image content —— 約定工具回傳含 `content` 的 dict（預組好的 MCP content 清單）時原樣透傳，否則照舊包 text。
+
+| 工具 | 接到哪裡 | 實作要點 |
+|---|---|---|
+| `get_view_range` | `main_vb.viewRange()`（:585） | 唯讀；回 `main_vb` 與 `second_vb` 的 x / y |
+| `zoom_to(t1, t2)` | `main_vb.setXRange` + 自動 y | y 由已畫曲線的 numpy 陣列 searchsorted 切片後 nanmin / nanmax（加 padding）算出；無已畫曲線時只動 x；`second_vb` 已 x-link（:595）免處理 |
+| `highlight_range(ranges)` | 新增 `pg.LinearRegionItem`，加進 `mouse_vb` 覆蓋層（:601，x / y 皆已 link） | `ranges=[[t1,t2],…]` 一次多段（三個中止點一次框完）、半透明填充、`movable=False`、每次呼叫取代先前標記；替代案是複用 measure lines（零新 UI），預設走 LinearRegion |
+| `measure_delta(t1, t2)` | `measure_line{1,2}.setPos`（:697）+ `update_measure_label`（:1942） | 標籤只在 `measure_mode` 時更新（:1943），工具須同時啟用 measure mode 並在回應明報 `measure_mode: true`；回 `{t1, t2, delta_s}` |
+| `plot_series(file?, column, columns?)` | `column_item.setCheckState(Checked)` → `on_item_changed`（:1245） | text kind 走既有路徑（只追蹤不畫曲線）；`file` 省略時套用到所有含該欄的已載入檔（fleet 一次框 9 條同名列）；回應逐檔 / 逐欄報 plotted / tracked / 已 active / absent |
+| `unplot_series(file?, column, columns?)` | `setCheckState(Unchecked)` | 同上；text 欄取消時同步移出 `active_text_series`（:1289） |
+| `compute_series(file?, column, mode)` | `create_computed_series`（:1508） | mode 為 `"1nd"` / `"2nd"` / `"abs"`；新欄自動勾選並畫出（:1555）、`file_stats_cache` 失效（:1545）；**字串欄必須先檢查再回錯——原方法會開 modal `QMessageBox.warning`（:1513），工具會卡到 60 s 逾時** |
+| `set_timezone(offset)` | `set_timezone_offset`（:956）+ 選單 QAction 打勾（:789） | -12 到 +12；以各窗回應的 `tz` 欄回讀 |
+| `search_text(q)` | `search_input.setText` + `search_global_text()`（:2111） | 驅動 GUI 下方搜尋表（人看見結果、可跳轉）；需至少一個已勾選的文字系列，否則回明確錯誤並列出可勾的 text kind 欄；`str.contains` 預設 regex（:2134），壞 pattern 要捕獲回錯；與 `find_text`（純查詢、無 GUI 副作用）在 schema 明寫區別 |
+| `screenshot_plot` | `plot_widget.grab()`（:572）→ PNG base64 | MCP image content（上述透傳約定）；僅 vision 模型有用 |
+
+驗收：
+
+- 回讀鏈：`zoom_to` → `get_view_range`；`plot_series` → `list_series.plotted` 含之、`unplot` 後消失；`compute_series` → 新欄名進 `list_series` 且 `get_window` 讀得到；`set_timezone` → 各窗回應 `tz` 改變。
+- `search_text`：文字 fixture 的命中數與 pandas 獨立計算相符；`measure_delta`：delta 精確；`highlight_range` / `screenshot_plot`：契約測試只驗呼叫成功與回應結構，視覺效果人工確認。
+- `mcp_test.py` 擴充（同一模式：HTTP 打真的 GUI）；既有 169 項全數照過；`MCP_INSTRUCTIONS`（:75）、F1 使用說明、`VERSION`（:41）同步更新。
+
+順序：先唯讀與檢視操作（`get_view_range` / `zoom_to` / `highlight_range` / `measure_delta` / `set_timezone` / `screenshot_plot`），再畫圖控制（`plot_series` / `unplot_series` / `compute_series` / `search_text`）——後者觸碰曲線建立、狀態較多。
+
+### M5 — 跨檔（fleet）層（新增，來自第三輪評價）
+
+依據：案例 C（9 檔同載、各 206 欄、同 schema）21 次呼叫中 18 次是同一查詢跑 9 檔的機械重覆，「23:22:52 全 9 節點同時中止」是人工比對得出的結論。驗收 fixture 為案例 C 的 9 檔。
+
+| # | 工項 | 介面 | 驗收 |
+|---|---|---|---|
+| F1a | `get_window` 多檔 | 多檔載入時 `file` 可省略 → 回覆 `t1` / `t2` / `tz` + `files: [{file, …}]`（每檔結果與現行單檔回覆相同，與 `find_changes` / `find_text` 的「省略＝全檔」慣例一致）；某檔缺欄時該檔給 `error` 項目，不中斷全呼叫 | 案例 C 一次呼叫回 9 檔的 `mpc_ctrl_mode` segments；單檔回覆與現行逐位元相同（舊 169 項照過） |
+| F1b | 跨檔聚類 | `fleet=true`（僅多檔、`segments` / `transitions` 適用）：各檔的 run 依（值、起點落在 `tolerance_s` 內，預設 1 s）聚類 → `fleet: [{value, t_start, t_end, n_files, files}]`；列數受 `max_points` 預算，超額標 `fleet_truncated` | 23:22:29–23:22:52 窗的 `halt` 行 `n_files=9`；A–G 七組事件一次呼叫全部可復現 |
+| F2 | `list_series` 多檔瘦身 | `file` 參數已存在（:2831，需驗證並寫進 SKILL.md——第三輪稱「無 file 參數」不成立）；加 schema 去重：範圍內各檔欄位集合相同時只回首份 + `same_as: [其餘檔]` | 9 檔 × 206 欄回一份清單 + 8 個檔名，遠低於現行 50 KB+ |
+| F5 | enum 值清單 | `list_series` 對 kind=enum 的系列附 `values: {name: […]}`：字串 enum distinct < 15、數值 enum < 3，門檻天然有界；memo 進 `SeriesState`（與 `distinct_count` 同處） | 103 的 `GWD` 值在進 segments 前就於 `list_series` 可見 |
+| F4 | 跨檔 `kind` 一致性 | 同一欄名跨檔 kind 不同（案例 C：`alarm_data` 8 檔 enum、107 檔 text）時，`list_series` 回頂層 `kind_conflicts: {name: {kind: [files]}}` | **只報不統一**：門檻是 per-file 設計，統一會改變繪圖行為 |
+| F3 | `find_text` 對密集訊號不足 | 不加參數：F1a 已覆蓋「落回 9 次 per-file `get_window`」；把「`find_text` 發現 → 多檔 `get_window` 細節」流程寫進 SKILL.md 與工具描述 | 第三輪的 21 次呼叫可壓到 10 次以內 |
+
+順序：F1a → F1b（核心）→ F2 → F5 → F4 → F3（文件）。
+
+### 執行順序與決策點
+
+```mermaid
+flowchart LR
+  M3["M3 ✅ 2026-10-12"] --> M4["M4（W9）GUI 操作"]
+  M4 --> M5["M5（F1–F5）跨檔層"]
+```
+
+- **待決策：M4 與 M5 的順序。** 預設 M4 先：已承諾的下一里程碑、範圍小、不影響既有回覆契約，且其驗收（異常點框在使用者眼前）直接補剛完成的 fleet 分析。若跨檔查詢是當前日常主流程，M5-F1 可提前——F1a 單獨就消掉 18 次機械重覆呼叫，且不阻塞 F1b。
+- `mcp_test.py` 隨每個里程碑擴充；每段可獨立 smoke test，不必等全鏈路。
+
 ## 待辦
 
 - [x] **M1 — 低風險（2026-10-12 完成）**：W7 家務／語意修正、W8 背壓、W10 載入透明度、W11 契約測試
 - [x] **M2 — 分析層主力（2026-10-12 完成）**：W4 `mode="summary"`、W1 `list_series detail`
 - [x] **M3 — 覆議後動工（2026-10-12 完成）**：W6' `find_text`（開放 regex）、W3 多欄與快照（覆蓋舊決議）、W5 `mode="aggregate"`
 - [ ] **M4 — Phase 3 UI 操作**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
+- [ ] **M5 — 跨檔（fleet）層（第三輪評價新增，2026-10-12 成文）**：F1 `get_window` 多檔 + 跨檔聚類、F2 `list_series` schema 去重、F5 enum 值清單、F4 跨檔 `kind` 一致性、F3 流程文件
 
 每階段可獨立 smoke test，不必等全鏈路完成；W11 契約測試隨任一段一起跑。
 

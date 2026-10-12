@@ -191,7 +191,7 @@ TODO.md 第 201 行已明文決議 **`不做（維持決議）：… headless / 
 | 73 次同型查詢（案例 B） | **batch CLI** | 一 process 解決，無 IPC、無逾時、無併發上限 |
 | 中斷長查詢 | **CLI** | MCP 只能等 `MCP_CALL_TIMEOUT`(60 s) 逾時 |
 
-MCP 現行的結構性瓶頸（行號為 2026-10-08 版）：呼叫一律排進 GUI thread 序列化（`McpBridge.call` 2277 → `_run_job` 2290），並行度上限為 1（即案例 B「73 個並行失敗、降到 12 一批」的根因，對應 TODO.md W8）；開啟 modal dialog 時整個 server 停滯（逾時訊息自身即寫 `is a modal dialog open?`）；綁死單一實例（`dataframes` 2485 / 2498 / 2603 / 2661），換一份 log 就得 `load_files` 並改動使用者畫面。這三點在 CLI 全部消失。
+MCP 現行的結構性瓶頸（行號為 2026-10-08 版）：呼叫一律排進 GUI thread 序列化（`McpBridge.call` 2277 → `_run_job` 2290），並行度上限為 1（即案例 B「73 個並行失敗、降到 12 一批」的根因，對應 TODO.md W8；2026-10-12 第三輪實測 9 並行 × 2 批全數成功，安全批次 ≥9）；開啟 modal dialog 時整個 server 停滯（逾時訊息自身即寫 `is a modal dialog open?`）；綁死單一實例（`dataframes` 2485 / 2498 / 2603 / 2661），換一份 log 就得 `load_files` 並改動使用者畫面。這三點在 CLI 全部消失。
 
 ### 「不做 headless / stdio」決議的評價
 
@@ -231,3 +231,89 @@ W9 只能靠 MCP。`plot_series` / `unplot_series` / `zoom_to` / `highlight_rang
 ### 一句話總結
 
 MCP 與 CLI 不是替代關係而是分工：MCP 是有狀態的 GUI 遙控器（零固定成本、獨佔畫面操作），CLI 是無狀態的批次資料處理器（跨檔、並行、可排程）；原決議「不做 headless / stdio」在其 scope 內正確，翻盤與否取決於你是否承認「無人在場的批次分析」為第二個目標——而在此之前，先抽出 Qt-free 引擎對兩條路線都是純收益。
+
+### 後續（2026-10-12 落地）：第三條路 —— skill + 直打 HTTP 的 proxy
+
+本節原本假設只能在「MCP（有狀態 GUI 遙控器）」與「batch CLI（無狀態批次處理器）」之間選。實際落地的第三條是：**協定留 MCP，客戶端換成一支 per-call 的 script**。
+
+- 形態：`~/.agents/skills/logplot/SKILL.md` + `logplot_mcp.py`（stdlib only；`status` / `tools` / `call` / `batch` / `start`）。打的是同一個 `POST 127.0.0.1:8790/mcp`（`initialize` / `tools/list` / `tools/call`），**server 端零改動、輸出契約零漂移**，`mcp_test.py` 的 169 項驗證全部繼續有效。
+- 成本：proxy 不需要 pandas 也不需要 Qt，實測 `json+urllib` 版直譯器啟動 **143 ms**（對照本節量到的 pandas 445 ms、PySide6 1 933 ms）；`batch` 一個 process 跑完 N 次查詢，所以「逐呼叫起 process 慢 40 倍」的結論不適用於這一支。
+- 與本節 CLI 方向的差別：它仍是「遙控眼前那個 GUI」（`load_files` 照樣改動使用者畫面），不是 headless 批次，也不提供跨檔掃描——所以它**不取代**本節評估的 batch CLI 需求。
+- 動機：omp 的 MCP 連線發生在 session 啟動、沒有 lazy 模式，而且**從未連上過的 HTTP server 不會被再探測**（只有「曾連上後斷線」的才有 15 s→5 min 的背景探測）→ GUI 沒開時工具根本不存在，且「先開 omp、後開 logplot」在同一 session 內永遠接不上。proxy 把「連線」變成使用者呼叫當下才發生的事。
+- 可攜性：`SKILL.md` 是跨 agent 的開放標準（agentskills.io），`~/.agents/skills` 同時被 omp、Codex CLI、Gemini CLI、Claude Code 等讀取；沒有 shell 的宿主則改用同一支管子包成 stdio MCP bridge。
+
+---
+
+## 第三輪評價：案例 C（fleet 場景：9 檔同載，2026-10-12）
+
+### 案例背景
+
+同型任務，從「單檔」升級為「多節點機隊」：9 台控制器 `log-20260928_mpc_ctrl_101..109.csv.zst` 同時載入同一 viewer，各 43 859–51 339 列、206 條訊號、同一時間窗（2026-09-28 19:01:46 → 09-29 01:12:24 UTC+8，約 6.2 h），各為不同節點。此 log 集的 `mpc_ctrl_mode` 直接是字串 enum（`ready/playing/playing_done/parking/halt/maintenance/shutdown/idle/calibrating/initializing`），不需像案例 A/B 解碼數值 state。
+
+判準同前兩輪：`playing → halt`（無 `playing_done`）為異常中止。
+
+結果：每節點 9–10 場播放（5 場正常收播：20:54:59 / 21:07:12 / 21:20:53 / 23:30:30 / 00:48:17），4–5 場異常中止，歸併為 7 組事件：
+
+| # | 起播 (UTC+8) | 中止 (UTC+8) | 已播 | 節點 | 中止時報警 |
+|---|---|---|---|---|---|
+| A | 09-28 23:01:19 | 23:01:24 | ~5 s | 107–109 | 107：HMI STOP (4.14) + S1–S6 伺服報警 (5.1)；108/109：僅 Halt (1.2) |
+| B | 09-28 23:08:49 | 23:09:07 | ~17 s | 104–106 | 104：Halt + HMI STOP + S1–S6；105/106：僅 Halt |
+| C | 09-28 23:11:40 | 23:12:02 | ~21.5 s | 101–103 | 三節點均 Halt + S1–S6 (4.26–4.31) |
+| D | 09-28 23:17:10 | 23:17:32 | ~22.4 s | 101–103 | 103：Halt + HMI STOP + S1–S6；101/102：僅 Halt |
+| E | 09-28 23:22:29 | 23:22:52 | ~23.2 s | **全部 9 節點** | 全部 Halt + S1–S6（106 缺 S5） |
+| F | 09-29 00:25:41 | 00:28:06 | ~144 s | 全部 9 節點 | 全部 Halt；107 另 FPGA (5.12) |
+| G | 09-29 00:34:56 | 00:37:21 | ~145 s | 全部 9 節點 | 全部 Halt；107 另 FPGA (5.12) |
+
+失敗呈**兩窗聚簇**：23:01–23:22 連續 5 輪播放全數失敗（含 3 輪全機隊同時中止），23:30 恢復正常，00:25 / 00:34 再失敗 2 輪，00:48 恢復——不是隨機單發。多組中止伴隨 S1–S6 六通道**同時**報警，指向共因事件（總線 / 電源 / HMI STOP）而非單台伺服故障。附帶發現：107 於 00:44:21 另有單發 RIO disconnected (4.3) + 全 I/O（SDI/SDO/DI/DO）報警風暴，之後保持 shutdown 至日志結束（00:48 那輪正常播放 107 實際未參與）；103 出現未見模式值 `GWD`（21:27:33–21:46:24，約 15.5 min，同段其他節點為 ready）；108 於日志截斷時（01:12:24）仍在 playing（01:09:19 起），不計為中止。
+
+調用統計：MCP 21 次（`list_files` 1、`list_series` 1、`get_window` 19），其中 18 次為 per-file `get_window`（9 × alarm_data 段 + 9 × mpc_ctrl_mode 段）；另文件讀取 3 次、`eval` 時區換算 1 次。`find_text` 讀了文件但 0 使用（發現步驟失誤，見痛點 3）。
+
+### 結論
+
+**單訊號取證 9/10；機隊關聯 4/10。** 前兩輪要求的查詢層（`summary/group_by`、`columns` 多讀、`drop_dominant`）全部到位，單檔鑑識已近乎無摩擦；但本輪主場景是「同一訊號 × 9 節點」，server 仍無任何跨檔能力，「23:22:52 全 9 節點同時中止」的結論仍是從 9 份結果人工比對出來的。機隊缺口是本輪最大落差，也是前兩輪（單檔場景）未曾觸及的方向。
+
+### 真正好用的部分
+
+- **`summary` + `group_by: value` 一次給出報警分類學。** 單次呼叫讀 `alarm_data` 值分布（12 種非 null 字串 + 各佔據秒數），全部報警代碼（1.1/1.2/1.3/3.x/4.x/5.x/6.1）一覽無遺——第一輪「alarm_data 拼接字串」的痛點，至少值分布讓 *發現* 可用，因果先後仍不可讀。
+- **`drop_dominant` 再次是主力（本輪兩段都靠它）。** 每檔 28–31 段報警、約 60 段 mode，全帶起止時間戳，5 萬列的 null/"ready" 被自動濾除。第二輪建議中價值最高的一項，在 fleet 場景再次驗證。
+- **`columns=[...]` 多訊號同讀（第二輪建議）落地：** 首次呼叫 6 條訊號（alarm/warn/state/mode/servo_alarm_1/t_last_sync）一趟讀完。
+- **9 並行呼叫穩定。** 兩批各 9 個 `get_window` 全數成功，對照案例 B「73 並行 RuntimeError、降到 12 一批才過」→ 併發上限介於 12 與 73 之間，9 並行是安全批次。
+- **透明度持續在線：** `held_truncated`（窗尾超出文件末端 0.06 s，回傳明言已 clamp）、`groups_truncated`（`t_last_sync` 704 個相異值，截 100 群並標註），無靜默省略。
+- **`list_files` 元資料對 fleet 一致性檢查有用：** monotonic、`sampling_median_s`、`largest_gap_s`、常數欄清單，一眼確認 9 檔同節奏同 schema、可互相比對。
+
+### 痛點（依嚴重度排序）
+
+1. **無跨檔查詢——本輪核心缺口。** 核心問題是「同一時刻哪些節點出了哪種報警」，但 `get_window` 只接受單檔，只能 9 份 segments 各抓一次再人工合併時間線；沒有「跨檔同值同段聚類」，也沒有「`file` 省略時回 per-file entries」。三輪「全機隊同時中止」全靠肉眼比對，這正是 fleet 任務的高頻查詢。
+2. **`list_series` 多檔爆量。** 206 訊號 × 9 檔、schema 完全相同，輸出 50 KB+ 且中段 elide，只能靠第一份清單。無 `file` 參數（不能只列單檔）、無「同 schema 只回一次」的去重。
+3. **`find_text` 是發現步驟的對的工具，但回傳只有「前 N 筆命中」。** 省略 `file` 全檔搜尋、回各檔命中數 + 相異值——「哪些節點有 servo alarm」正好一步到位。但對密集變化訊號，命中列表不能取代完整 change list，仍要落回 9 次 per-file `get_window`。一半是工具限制（無 per-file segments 模式），一半是我自己的流程失誤（讀過文件卻直接走 per-file segments，沒先拿它當發現步驟）。
+4. **`kind` 跨檔不一致。** `alarm_data` 在 8 檔為 `kind: "enum"`、107 為 `kind: "text"`（疑似相異值數觸發升級），同一訊號名兩種標籤，呼叫端無法按名稱固定策略。
+5. **未知 enum 值無碼表可問。** 103 的 `GWD` 模式值直接出現在 segments 裡，無 label 表可查語意，只能人工跟進。
+6. **小摩擦（本輪自身責任）：** `time_format: iso` + `tz` 自第二輪已存在，我未用，事後 `eval` 二次換算 Unix→+08:00；文件 on-demand 讀取多 3 次往返（可接受成本）。
+
+### 與第二輪建議的對照
+
+| 第二輪建議 | 現況 |
+|---|---|
+| `summary` / `group_by` 依結局分組 | ✅ 已實作，本輪發現階段主力 |
+| 單點取值 `t1 == t2` / `snapshot` | ✅ 已實作（本輪未用） |
+| `aggregate` 區間彙總 | ✅ 已實作（本輪未用） |
+| `get_window(columns=[...])` 多欄同讀 | ✅ 已實作，已使用 |
+| 重複訊號 `duplicate_of` | ❌ 仍未見 |
+| `kind` 誤標 | ❌ 仍在，且本輪新增「同訊號名跨檔 kind 不同」案例 |
+| enum 附 `labels` 碼表 | ❌ 仍缺（此 log 集 `mpc_ctrl_mode` 直出字串，症狀性緩解；`mpc_ctrl_state` 仍是數值碼 0/1/4/5/6/7/8/9/10/14，未解碼） |
+| `alarm_data` 結構化 | ❌ 仍為拼接字串（值分布發現可用，因果先後仍不可讀） |
+| `plot` / `highlight` 引導 viewer | ❌ 仍無（工具仍為 6 個，無 plot/zoom/highlight） |
+
+### 改進建議（本輪新增）
+
+| 痛點 | 建議 |
+|---|---|
+| 無跨檔查詢 | `get_window` 的 `file` 在多檔載入時可省略 → 回 per-file entries；或增 `fleet` 模式：給訊號 + 偏差條件（如 `drop_dominant`），回「值 × 時段 × 涉及文件清單」聚類行，直接回答「幾個節點同時」 |
+| `list_series` 多檔爆量 | `list_series` 加 `file` 參數只列單檔；全部 schema 相同時回首份清單 + `same_as: [...]` |
+| `find_text` 對密集訊號不足 | 加可選 `mode: segments`（或 per-file 完整 change list），讓它成為發現→細節的一站式工具 |
+| `kind` 跨檔不一致 | 依訊號名跨所有載入檔統一計算 kind，或回 `kind_per_file` 明示 |
+| 未知 enum 值 | 第二輪已建議的 enum 附 `values` 相異值清單仍值得優先，讓 `GWD` 型值可對照碼表 |
+
+### 一句話總結
+
+前兩輪「讀取層紮實、分析層缺席」在單檔側已修好一半（`summary`/`columns`/`drop_dominant` 全數落地，單檔鑑識近乎一鍵）；本輪 fleet 場景暴露的是分析層的另一半——**跨節點關聯**：21 次呼叫中 18 次是同一查詢跑 9 檔的機械重覆，若「同訊號 × N 檔」能一次回答，本題可壓到 10 次以內，而「全機隊同時中止」會從人工比對結論變成工具回傳的一行。
