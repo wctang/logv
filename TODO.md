@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。Phase 2 / 3 待做。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文，工項 M1–M4 / W1–W11 待做。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -15,6 +15,9 @@
 | 埠預設 | **啟動即開 8790**，`--mcp-port PORT` 換埠、`--mcp-port 0` 關閉 | 使用者慣用的啟動方式即可用，不必每次記旗標 |
 | 認證 | 可選 Bearer token：`--mcp-token` 或 `$LOGPLOT_MCP_TOKEN`；**不寫進任何檔案** | repo 公開；`%TEMP%` 的探索檔是世界可讀的 |
 | 破壞性工具 | **永久不開放** | `remove_all_files` / `remove_file` / `save_state` / `load_state` / `update_script` |
+| 唯一契約 | **只假設 CSV 與第一欄是 timestamp**；不得內建任何 payload 文法或值語意 | 實務上格式與形態繁多（見 Phase 2.5 五檔實測）；依「看過的 log 內容」寫死的解析，下一批 log 就失效 |
+| 語意來源 | 使用者載入的 SignalList（`display_name`）或呼叫端參數；伺服器只回結構事實 | 同上 |
+| `kind` 的角色 | **僅描述 viewer 怎麼畫**，不作為輸出策略的依據；不以基數自動重判 enum / code | `AI_W1`=〔0,1,16,17,256,272,273〕、`SVOHR1`=〔0,18615…18623〕與 `mpc_ctrl_state`=〔1,2,7,8,9,10,12〕結構上不可分 |
 | headless / stdio 模式 | **不做**（2026-10-08 決定） | 需求是驅動 GUI，不是無頭批次 |
 | omp 設定位置 | **用戶層 `~/.omp/agent/mcp.json`** | 任何 cwd 都生效；不動公開 repo 的檔案 |
 | 已放棄路線 | UI 內建對話 agent（openai SDK + `QDockWidget` + 本機 llama.cpp） | 需在 UI 養對話框、管 key、加依賴；MCP 路線同樣能達到目的且零依賴 |
@@ -49,7 +52,7 @@ flowchart LR
 | 執行緒 | HTTP daemon thread；`_McpJob(name, args, event, result)` 經 `McpBridge.call_requested`（`Signal(object)`，跨執行緒自動 queued）送進 GUI thread，HTTP thread 以 `Event.wait(60s)` 等結果；逾時回 `isError` |
 | 認證 | 有 token 時檢查 `Authorization: Bearer`，不符回 401 |
 | 探索 | 啟動時寫 `%TEMP%\logplot-mcp.json`（`url` / `port` / `auth` / `pid`，**不含 token**），`closeEvent` 時刪除 |
-| 開放的唯一工具 | `load_files`（idempotent：已載入的檔案不重讀、不長出重複樹節點；非字串路徑列進 `failed` 而非靜默忽略）|
+| 開放的唯一工具（Phase 1） | `load_files`（idempotent：已載入的檔案不重讀、不長出重複樹節點；非字串路徑列進 `failed` 而非靜默忽略）；Phase 2 之後另有 4 個唯讀工具，見「工具清單」 |
 | UI 回饋 | Help 選單顯示 `MCP Server: 127.0.0.1:8790 (token required / no auth)`；狀態列訊息；使用說明（F1）有對應段落 |
 
 omp 端（用戶層 `~/.omp/agent/mcp.json`）：
@@ -99,6 +102,8 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 
 ### 工具參數慣例
 
+（本節與上表是 Phase 2 前的規劃；Phase 2.5 的 W1–W11 是其超集，衝突時以 Phase 2.5 為準。）
+
 - 檔案識別一律用 `file`（值為 `list_files` 回報的完整路徑），輸出也用 `file` 當鍵。
 - `McpBridge._resolve_file()` 依序嘗試：完全相符 → `normcase(abspath())` 正規化比對（大小寫 / 斜線差異可通過）→ 唯一 basename；都不中就報錯並列出已載入的檔案。
 - 訊號識別一律用 `column`，值取自 `list_series` 的 `numeric_series` / `string_series`。
@@ -106,22 +111,105 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - 時間一律 Unix 秒（UTC, float）。
 - `kinds` 是 viewer 自己的繪圖分類，由 `SeriesState.kind` 單一來源計算並記憶：`enum`（右軸車道，distinct 少）／`analog`（主軸）／`text`（自由文字，只追蹤不畫）。門檻為 `STRING_TEXT_THRESHOLD`(15) 與 `NUMERIC_ENUM_THRESHOLD`(3)，兩個數值不再內嵌於勾選路徑。
 - 注意：`list_series` 第一次讀一檔會替每欄做一次全欄 distinct 計數（125 欄實測約 0.5 s，在 GUI thread），之後由 `SeriesState` 快取（1.4 ms）。勾選路徑因此不再重算。
-- **時間視窗的表示法（`find_changes` / `get_window` 共用）**：變化清單 `segments: [[t, value], …]`，值的有效範圍**到下一段為止**（最後一段到 `t2`），頭尾相連故不重複 `t_end`。區間是雙端閉區間；`t ≥ 1e11` 沿用 `search_by_timestamp` 的規則視為 ns。
-- **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。
+- **時間視窗的表示法（`find_changes` / `get_window` 共用）**：變化清單 `segments: [[t, value], …]`，值的有效範圍**到下一段為止**（最後一段到 `t2`；Phase 2.5 W7 將在 `t2` 超過資料末筆時夾限到資料末筆並標 `held_truncated`），頭尾相連故不重複 `t_end`。區間是雙端閉區間；`t ≥ 1e11` 沿用 `search_by_timestamp` 的規則視為 ns。
+- **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。→ Phase 2.5 覆議點 1：W3 的多欄快照（`t1 == t2`）建議覆蓋此決議，因為實務需求是「某一瞬間 N 條訊號」。
 - **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_segment_starts()` 用 `pd.isna` 做這個遮罩；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
 - **`file` 可省略**：只載入一個檔案時 `get_window` 不必帶 `file`；`file` 也接受唯一 basename（`_resolve_file(..., allow_default=True)`）。多檔時才回錯並列出已載入檔案。
-- **四種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四者共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（低基數數值其實是代碼）。
+- **四種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四者共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（= 逐值出現次數；是否為代碼由呼叫端判讀，見 Phase 2.5）。
 - **`min_duration`（去抖動）**：短於 N 秒的區段直接丟棄、由前一段延伸覆蓋，去抖後相鄰同值再合併（`_merge_equal_runs`），並回報 `segments_before` 以示透明。`drop_dominant` 只保留「佔用時間最長的值」以外的區間。
 - **時間格式**：`t1` / `t2` 接受 Unix 秒或 ISO 8601（naive 字串用 viewer 時區解讀）；`time_format: "iso"` 讓回應的時間全部變成帶偏移的 ISO 字串（毫秒先四捨五入再格式化，避免看起來差 1 ms）。回應一律附 `tz`（如 `+08:00`）。
 - **`find_changes` 的 `unchanged_columns`** 只在單一檔案時提供（多檔時裸欄名有歧義），並受 `limit` 上限。
-- **不採納「呼叫端覆寫 `kind`」**（suggest.md 建議）：實測後確認 `kind` 在 `get_window` 內只影響 metadata，dense 分支是依 `dtype` 判斷，而低基數數值的分布已由 `dense` 的 `values` 提供，所以覆寫參數會是個沒有實際作用的多餘欄位。
+- **不採納「呼叫端覆寫 `kind`」**（suggest.md 建議）：實測後確認 `kind` 在 `get_window` 內只影響 metadata，dense 分支是依 `dtype` 判斷，而低基數數值的分布已由 `dense` 的 `values` 提供，所以覆寫參數會是個沒有實際作用的多餘欄位。（Phase 2.5 W2 進一步把 `kind` 排除於輸出政策之外；兩個門檻值不變。）
+
+## Phase 2.5 計畫修訂（2026-10-09）
+
+依據：suggest.md 兩輪評價 × 五份真實 log 實測。行號為 2026-10-08 版 `logplot.py`，以方法名為準。
+
+### 設計原則
+
+只有兩件事可以假設：**CSV 格式、第一欄是 timestamp**。其餘一律當未知——欄數可為 1、欄名任意、值是數值／字串／`[]`／hex／JSON-ish／空白、單位與取樣率未知、任何 payload 文法未知。
+
+伺服器只回答**結構事實**：dtype 家族、相異值數、變更位置與次數、取樣間隔、時間範圍。**語意**（`12` 是什麼、`AI_W1` 是 bitfield、`LOG` 那串字的意義）只能來自呼叫端，或使用者自己載入的 SignalList。
+
+### 撤回的前一版構想
+
+| 構想 | 處置 | 實測理由 |
+|---|---|---|
+| `alarm_data` 內建 `(i:.. o:.. s:.. m:..)` 解析 | **撤回** | 那是對特定 log 內容的猜測；改由呼叫端傳 pattern 的 `find_text`（W6'）取代 |
+| 依基數把低基數整數自動改判 enum / code | **撤回** | 反例見「已定案的決策」的 `kind` 列 |
+| 把「同變化位置」的配對叫 `codes`（碼表） | **降級為中性事實** | `mpc_ctrl_orig_1/2`、`GT1/GT3_2`、`SVOST1*`（49 欄同時變）同時間但值不同；只有值序列也相同才是同一訊號 |
+
+保留的推論只有「變化位置完全相同 ⇒ 時序同步」，這是結構事實。
+
+### 五份 log 的結構實測（驗收基準）
+
+| 檔案 | 資料欄 | 列數 | timestamp 分支 | 中位取樣 | 最大間隙 | 相異值 ≤2 的欄 | 同變化位置群組 | 值也相同的可去重名 | 從不變的欄 |
+|---|---|---|---|---|---|---|---|---|---|
+| `log-20260814_mpc_104.csv.zst` | 205 | 138 470 | `%Y-%m-%d %H:%M:%S.%f` | 1.000 s | 1.0 s | 139 | 20 群 / 127 欄 | 41 | 60 |
+| `osman_cakir_log-20260830_mpc_104.csv.zst` | 178 | 256 906 | 同上 | 0.200 s | 2 025 s | 130 | 7 群 / 87 欄 | 21 | 49 |
+| `log-fujiq-20260706_mpc_101.csv.zst` | 210 | 146 760 | 同上 | 0.200 s | 1.0 s | 161 | 10 群 / 92 欄 | 36 | 44 |
+| `log-20260101.log_msg_105.csv.zst` | 1（純文字，45 273 相異值） | 287 960 | 同上 | 0.100 s | 22 462 s | 0 | — | — | 0 |
+| `log-htb-20260101.log_mpc_ctrl_101.csv.zst` | 124 | 337 010 | 同上 | 0.100 s | 22 481 s | 67 | 15 群 / 61 欄 | 46 | 2 |
+
+- 五檔皆 monotonic、**重複時間戳 = 0**；全數命中同一 format 分支（是清單巧合，同時也是風險，見 W10）。
+- 結構掃描成本：相異值 0.07–0.51 s／檔、變化位置簽章 0.12–0.24 s／檔。
+- 文字欄「窗內值先去重再比對」：45 273 個相異值 / 0.027 s。
+- FSM 判準複驗（`mpc_ctrl_mode`）：101 檔 349 段 / 14 種 `(from,to)` / playing 78 場、3 場 `→halt`、正常 350.260–351.457 s；105 檔 334 段 / 76 場、3 場、349.852–351.847 s；三筆中止時間與 suggest.md 一致至毫秒。
+
+### 工項
+
+| # | 工項 | 目標 | 驗收 |
+|---|---|---|---|
+| W1 | `list_series detail=true` | 事實層：`distinct` / `changes` / `constant` / `duplicate_of`（值序列也相同）/ `same_timing_as`（僅時間同步）/ `value_pairs`（時間完全同步且映射為函數，中性命名、≤32 筆） | 五檔皆 <0.3 s；200+ 欄檔要標出 44–60 欄「從不變」群組 |
+| W2 | `kind` 解耦 | `segments` / `transitions` / `dense` 只依窗內段數與 `max_points` 決定，不依 `kind`；schema 明寫 `transitions` 對任何欄可用；`list_series` 附 `kind_reason`（distinct=N / 門檻） | `servo_alarm_code_1/2`（值與變化位置相同）走同一路徑；門檻值不動 |
+| W3 | `get_window` 多欄與快照 | `columns=[...]`；`t1 == t2` → `mode="snapshot"`（每欄最後一個 ≤t 的樣本） | 中止 A（07:37:20.308）一次呼叫列出 mode / state / t_play / run / st / en / alarm_data |
+| W4 | `mode="summary"` | `group_by="transition"`（from→to 次數、held min/median/max）與 `group_by="value"`（各值佔用時間與次數） | `mpc_ctrl_mode` 全檔 14 組、`playing→halt` = 3、正常場長與三筆中止時間同 suggest.md |
+| W5 | `mode="aggregate"` | `every=N` + `agg=[min,max,last,first]`，dense 時附 `buckets` | `t_play` 5 分鐘窗一眼看出爬到全長後歸零 |
+| W6' | `find_text` | 呼叫端傳 `pattern`（預設 literal，可切 regex）/ `ignore_case` / `columns?` / `t1,t2` / `limit`；回每欄命中數、前 N 筆 `[t, column, value]`、去重命中清單 | `find_text("Halt command received")` 在 htb 101 的 `alarm_data` 與 `log_msg_105` 的 `msg` 都命中；**伺服器內不含任何 `(i:o:s:m:)` 或 `I:stop:` 知識** |
+| W7 | 家務與語意修正 | `unchanged_columns` 改 opt-in（永遠回計數）；`held_seconds` 末端夾限到 `min(t2, 資料末筆)` 並標 `held_truncated`；`min_duration` 描述改為「segments 與 transitions 皆適用」；標 `window_too_small` | `t2` 超過資料末筆時 `held_seconds` 不再隨之膨脹 |
+| W8 | 背壓 | 待處理 > 8 筆回明確 `server busy`（工具本來就在 GUI thread 序列化） | 併發 73 個呼叫得到可讀錯誤，而非無聲中止 |
+| W9 | viewer 控制（Phase 3） | `plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot` | 算出的異常點能在使用者眼前框出來 |
+| W10 | 載入透明度 | `list_files` / `load_files` 每檔附 `timestamp_column` / `timestamp_parse`（命中哪個分支）/ `monotonic` / `duplicate_timestamps` / `sampling_median_s` / `largest_gap_s` / `constant_columns`；`failed.reason` 帶真正例外；解析後範圍檢查（1990–2100），歧義時標 `timestamp_ambiguous` | 兩份新 log 的 `sampling_median_s` 回 1.0 / 0.2 s、`largest_gap_s` 回 1.0 / 2 025 s |
+| W11 | 契約測試 | 五檔 smoke（含 2 欄純文字檔與 206 欄檔）＋「只有 timestamp 一欄」的合成 CSV | 單欄檔得到清楚錯誤而非靜默丟棄（現行 `load_csv_files` `:978` 的 `df.shape[1] < 2` 直接 `continue`） |
+
+實作要點：
+
+- 接觸點：`SeriesState._classify`（:133）、`SeriesState.kind`（:119）、門檻（:47-48）、`_tool_list_series`（≈:2483）、`_tool_get_window`（≈:2600）、`_dense_window`（≈:2702）、`_drop_short_runs`（:2221）、`_merge_equal_runs`（:2235）、`_describe_file`（≈:2418）。
+- 事實層快取失效點：`load_csv_files`（:969）、`remove_file`（:1287）、`remove_all_files`（:1279）、`create_computed_series`（:1356，會新增欄）。
+- `held_seconds` 的夾限必須同時用在 `_drop_short_runs(..., end=...)`，否則去抖與 `transitions` 的時長會不一致。
+- 現行 `load_csv_files`（:1027）把例外只 `print` 到 stdout，MCP 端永遠只看到 "missing, empty, or unreadable"——W10 要把它接進 `failed.reason`。
+- `pattern` 的 ReDoS 邊界（覆議點 3）：pattern 長度上限、只對窗內去重後的字串比對、逐值 try/except、總時限。
+
+### 執行順序
+
+```mermaid
+flowchart LR
+  M1["M1<br/>W7 + W8 + W10"] --> M2["M2<br/>W4 + W1"]
+  M2 --> M3["M3<br/>W6' + W3 + W5"]
+  M3 --> M4["M4<br/>W9"]
+  M1 -.-> W11["W11 契約測試<br/>五檔 smoke"]
+```
+
+M1 低風險先落地；M2 是分析層主力（做完後 suggest.md 案例 B 的三行答案由 1 次呼叫取得）；M3 含兩項待覆議決策。
+
+### 待覆議
+
+1. **W3 多欄快照**與本檔「`get_value` 已決議不做」衝突——建議覆蓋，因為實際需求是「某一瞬間 N 條訊號」，不是單點查值。
+2. **W9 是否提前** plot / zoom / highlight（suggest.md 兩輪都點名 `plotted` 唯讀是最大缺口）。
+3. **W6' 是否開放具名群組的 regex**（換得結構化輸出，代價是 ReDoS 邊界，需 pattern 長度上限等防護）。
+
+### 不做（維持決議）
+
+內建任何內容文法解析（alarm / LOG / msg / hex）；以基數自動重判 `kind` 或聲稱「碼表」；通用謂詞引擎 `find_events(prev(x)!=y)`（若日後仍不足，再收斂成 `find_events(column, from, to)`）；`get_at`；`kind` 覆寫參數；headless / stdio；破壞性工具。
 
 ## 待辦
 
-- [ ] **Phase 2 — 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window` 已完成）：`search_text` / `get_view_range`
-- [ ] **Phase 3 — UI 操作工具**：`plot_series` / `unplot_series` / `zoom_to` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`
+- [ ] **M1 — 低風險**：W7 家務／語意修正、W8 背壓、W10 載入透明度
+- [ ] **M2 — 分析層主力**：W4 `mode="summary"`、W1 `list_series detail`
+- [ ] **M3 — 覆議後動工**：W6' `find_text`、W3 多欄與快照、W5 `mode="aggregate"`
+- [ ] **M4 — Phase 3 UI 操作**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
 
-每階段可獨立 smoke test，不必等全鏈路完成。
+每階段可獨立 smoke test，不必等全鏈路完成；W11 契約測試隨任一段一起跑。
 
 ## 風險
 
@@ -131,3 +219,4 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - [ ] **omp 會改寫字串參數**：omp 送出前會把字串值中「像內部 URL」的（含 `local://`、file-backed 內部 URL）換成實際檔案路徑，所以參數驗證要以改寫後的 payload 為準。另 `i` 欄位會被剝除。
 - [ ] **埠衝突**：第二個實例 bind 失敗只印 `[mcp] could not listen on 127.0.0.1:8790`，程式照常運作，不會影響正在跑的那個。
 - [ ] **PyStand 版落後**：`D:\log_tools\logplot.exe` 與 `D:\log_tools\logplot.py` 是先前部署的副本，沒有 MCP；要走 exe 得重打包（`build.py`），或先用 `logplot.bat`。
+- [ ] **格式假設**：任何以「看過的 log 內容」為依據的解析（欄名語意、值文法、單位、碼表）都會在下一批 log 失效；伺服器不得內建語意，見 Phase 2.5「撤回的前一版構想」。時間戳解析鏈亦同——五檔目前都命中同一 format 分支，屬清單巧合（W10 要回報實際命中分支並做範圍檢查）。
