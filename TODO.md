@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試），M2–M4 與其餘 W 待做。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`），M3–M4 待做。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -88,9 +88,9 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 |---|---|---|
 | `load_files(paths)` | `load_csv_files`（:927） | ✅ Phase 1 |
 | `list_files()` | `dataframes` → 逐檔 rows / columns / start / end + 載入透明度欄位（M1）；慢掃描由 `file_stats_cache` 快取 | ✅ Phase 2 + M1 |
-| `list_series(file?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels` / `kinds`（不回數值） | ✅ Phase 2 |
+| `list_series(file?, detail?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels` / `kinds`（不回數值）；`detail=true` 另附 `facts`（M2） | ✅ Phase 2 + M2 |
 | `find_changes(t1, t2, file?, limit?, include_unchanged?, time_format?)` | 逐欄 `shift()` 比較（`_changed_counts`），回有變化的訊號與次數（忙的在前）＋未變動計數；篩選層 | ✅ Phase 2 + M1 |
-| `get_window(file?, column, t1, t2, max_points?, mode?, min_duration?, drop_dominant?, time_format?)` | 變化清單（精確 RLE）／`transitions`／`deviations`，超出預算轉 `dense`；末端夾限／`held_truncated`／`window_too_small`（M1） | ✅ Phase 2 + M1 |
+| `get_window(file?, column, t1, t2, max_points?, mode?, group_by?, min_duration?, drop_dominant?, time_format?)` | 變化清單（精確 RLE）／`transitions`／`summary`／`deviations`，超出預算轉 `dense`；末端夾限／`held_truncated`／`window_too_small`（M1）、摘要分組（M2） | ✅ Phase 2 + M1 + M2 |
 | `search_text(q)` | `search_input.setText` + `search_global_text()`（:1923） | Phase 2 |
 | `get_view_range` | `main_vb.viewRange()` | Phase 2 |
 | `plot_series` / `unplot_series` | `column_item.setCheckState()` → `on_item_changed`（:1056） | Phase 3 |
@@ -113,10 +113,11 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - 注意：`list_series` 第一次讀一檔會替每欄做一次全欄 distinct 計數（125 欄實測約 0.5 s，在 GUI thread），之後由 `SeriesState` 快取（1.4 ms）。勾選路徑因此不再重算。
 - **時間視窗的表示法（`find_changes` / `get_window` 共用）**：變化清單 `segments: [[t, value], …]`，值的有效範圍**到下一段為止**（最後一段到 `t2`，但 M1 起在 `t2` 超過資料末筆時夾限到資料末筆並標 `held_truncated`），頭尾相連故不重複 `t_end`。區間是雙端閉區間；`t ≥ 1e11` 沿用 `search_by_timestamp` 的規則視為 ns。
 - **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。→ Phase 2.5 覆議點 1：W3 的多欄快照（`t1 == t2`）建議覆蓋此決議，因為實務需求是「某一瞬間 N 條訊號」。
-- **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_segment_starts()` 用 `pd.isna` 做這個遮罩；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
+- **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_unchanged_mask()` 是唯一的比較規則（`_segment_starts` / `_change_facts` / `list_series` 的事實層都讀它）；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
 - **`file` 可省略**：只載入一個檔案時 `get_window` 不必帶 `file`；`file` 也接受唯一 basename（`_resolve_file(..., allow_default=True)`）。多檔時才回錯並列出已載入檔案。
-- **四種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四者共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（= 逐值出現次數；是否為代碼由呼叫端判讀，見 Phase 2.5）。
-- **`min_duration`（去抖動）**：短於 N 秒的區段直接丟棄、由前一段延伸覆蓋，去抖後相鄰同值再合併（`_merge_equal_runs`），並回報 `segments_before` 以示透明。**`segments` 與 `transitions` 皆適用**（M1 起 schema 明寫）。`drop_dominant` 只保留「佔用時間最長的值」以外的區間，且僅 `segments` 適用。
+- **五種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`，**每段一列**故列數＝段數）／`summary`（M2，搭配 `group_by`：`transition` 或 `value`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四種列舉型模式共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（= 逐值出現次數；是否為代碼由呼叫端判讀，見 Phase 2.5）。
+- **`summary` 的預算是例外（M2）**：摘要本身是歸約，列數受群組數限制而非段數，所以 `max_points` 只截斷群組列並在 `groups_truncated: true` 時說明；`group_count` 永遠是完整群組數。
+- **`min_duration`（去抖動）**：短於 N 秒的區段直接丟棄、由前一段延伸覆蓋，去抖後相鄰同值再合併（`_merge_equal_runs`），並回報 `segments_before` 以示透明。**所有模式皆適用**（M1 起；M2 的摘要吃去抖後的段）。`drop_dominant` 只保留「佔用時間最長的值」以外的區間，且僅 `segments` 適用。
 - **`window_too_small`（M1）**：窗內樣本數 < 2 時附此旗標 —— 空窗、只落一個樣本、以及 `t1 == t2` 因 Unix 秒是 float（2026 年解析度約 240 ns）而落在樣本旁，都會出現。單樣本仍回那名值在 `segments` 裡。
 - **時間格式**：`t1` / `t2` 接受 Unix 秒或 ISO 8601（naive 字串用 viewer 時區解讀）；`time_format: "iso"` 讓回應的時間全部變成帶偏移的 ISO 字串（毫秒先四捨五入再格式化，避免看起來差 1 ms）。回應一律附 `tz`（如 `+08:00`）。
 - **`find_changes` 的 `unchanged_columns`**：`unchanged_series`（計數）永遠回；**名稱清單需 `include_unchanged: true`**（M1 起，因窄窗也回整份清單曾被評為零價值資訊），且只在單一檔案時提供（多檔時裸欄名有歧義），並受 `limit` 上限。
@@ -157,7 +158,7 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - **「從不變的欄」的定義** = 整檔 `find_changes` 的 `unchanged_series`（`_changed_counts` 逐欄比較，空白對空白算沒變），也就是 `list_files` 現在回的 `constant_count`。這**不等於**「相異值 ≤ 1」：只有一個非空白值、但會與空白交替的欄仍算有變化（`mpc_ctrl_curr_motion_signature` 就是這種，兩個算法在 105 檔差 1、在 htb 101 差 1）。
 - 中位取樣與最大間隙是**四捨五入後的顯示值**（1 ms／1 s）。2026-10-12 實測原值：`log-20260814_mpc_104` = 1.000051 s / 1.031859 s、`log-fujiq-20260706_mpc_101` = 0.199904 s / 1.030077 s、`log-20260101.log_mpc_ctrl_105` = 0.100091 s / 22482.002826 s、`log-htb-…101` = 0.100091 s / 22480.815657 s、`log-…msg_105` = 0.100113 s / 22462.372999 s。
 - 2026-10-12 更正：`log-htb-…101` 一列原記「資料欄 124、從不變 2」有誤。資料欄 = CSV 標頭欄數 − timestamp = 126 − 1 = **125**（與 suggest.md「125 條訊號」及同檔 `find_changes` 的 31 一致）；從不變的欄為 **31**（M1 實測，與另一支獨立腳本相符）。
-- 結構掃描成本：相異值 0.07–0.51 s／檔、變化位置簽章 0.12–0.24 s／檔。
+- 結構掃描成本：相異值 0.07–0.51 s／檔、變化位置簽章 0.12–0.24 s／檔（M2 起簽章與變化次數改由 `_change_facts` 逐欄一次算完，實測數字見 M2 完成紀錄）。
 - 文字欄「窗內值先去重再比對」：45 273 個相異值 / 0.027 s。
 - FSM 判準複驗（`mpc_ctrl_mode`）：101 檔 349 段 / 14 種 `(from,to)` / playing 78 場、3 場 `→halt`、正常 350.260–351.457 s；105 檔 334 段 / 76 場、3 場、349.852–351.847 s；三筆中止時間與 suggest.md 一致至毫秒。
 
@@ -165,10 +166,10 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 
 | # | 工項 | 目標 | 驗收 |
 |---|---|---|---|
-| W1 | `list_series detail=true` | 事實層：`distinct` / `changes` / `constant` / `duplicate_of`（值序列也相同）/ `same_timing_as`（僅時間同步）/ `value_pairs`（時間完全同步且映射為函數，中性命名、≤32 筆） | 五檔皆 <0.3 s；200+ 欄檔要標出 44–60 欄「從不變」群組 |
+| W1 | ✅ `list_series detail=true`（M2） | 事實層：`distinct` / `changes` / `constant` / `duplicate_of`（值序列也相同）/ `same_timing_as`（僅時間同步）/ `value_pairs`（時間完全同步且映射為函數，中性命名、≤32 筆） | 五檔皆 <0.3 s（實測 37–40 ms／檔）；200+ 欄檔要標出 44–60 欄「從不變」群組 |
 | W2 | `kind` 解耦 | `segments` / `transitions` / `dense` 只依窗內段數與 `max_points` 決定，不依 `kind`；schema 明寫 `transitions` 對任何欄可用；`list_series` 附 `kind_reason`（distinct=N / 門檻） | `servo_alarm_code_1/2`（值與變化位置相同）走同一路徑；門檻值不動 |
 | W3 | `get_window` 多欄與快照 | `columns=[...]`；`t1 == t2` → `mode="snapshot"`（每欄最後一個 ≤t 的樣本） | 中止 A（07:37:20.308）一次呼叫列出 mode / state / t_play / run / st / en / alarm_data |
-| W4 | `mode="summary"` | `group_by="transition"`（from→to 次數、held min/median/max）與 `group_by="value"`（各值佔用時間與次數） | `mpc_ctrl_mode` 全檔 14 組、`playing→halt` = 3、正常場長與三筆中止時間同 suggest.md |
+| W4 | ✅ `mode="summary"`（M2） | `group_by="transition"`（from→to 次數、held min/median/max）與 `group_by="value"`（各值佔用時間與次數） | `mpc_ctrl_mode` 全檔 14 組、`playing→halt` = 3、正常場長與三筆中止時間同 suggest.md |
 | W5 | `mode="aggregate"` | `every=N` + `agg=[min,max,last,first]`，dense 時附 `buckets` | `t_play` 5 分鐘窗一眼看出爬到全長後歸零 |
 | W6' | `find_text` | 呼叫端傳 `pattern`（預設 literal，可切 regex）/ `ignore_case` / `columns?` / `t1,t2` / `limit`；回每欄命中數、前 N 筆 `[t, column, value]`、去重命中清單 | `find_text("Halt command received")` 在 htb 101 的 `alarm_data` 與 `log_msg_105` 的 `msg` 都命中；**伺服器內不含任何 `(i:o:s:m:)` 或 `I:stop:` 知識** |
 | W7 | ✅ 家務與語意修正（M1） | `unchanged_columns` 改 opt-in（永遠回計數）；`held_seconds` 末端夾限到 `min(t2, 資料末筆)` 並標 `held_truncated`；`min_duration` 描述改為「segments 與 transitions 皆適用」；標 `window_too_small` | `t2` 超過資料末筆時 `held_seconds` 不再隨之膨脹 |
@@ -189,7 +190,7 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 
 ```mermaid
 flowchart LR
-  M1["M1 ✅ 2026-10-12<br/>W7 + W8 + W10"] --> M2["M2<br/>W4 + W1"]
+  M1["M1 ✅ 2026-10-12<br/>W7 + W8 + W10"] --> M2["M2 ✅ 2026-10-12<br/>W4 + W1"]
   M2 --> M3["M3<br/>W6' + W3 + W5"]
   M3 --> M4["M4<br/>W9"]
   M1 -.-> W11["W11 ✅ 契約測試<br/>mcp_test.py"]
@@ -242,10 +243,61 @@ W7 / W8 / W10 已實作，W11 契約測試成形為 `mcp_test.py`（75 項檢查
 - 強制終止 logplot（非正常關閉）會留下 `%TEMP%\logplot-mcp.json`，正常 `closeEvent` 會刪除。omp 的設定寫死 URL 不受影響，但探索檔沒有 crash 保險。
 - Unix 秒是 float，在 2026 年解析度約 240 ns，所以把 `list_files` 回的 `end` 原樣丟回去當 `t1 == t2` 可能落在樣本旁邊（回 `samples: 0`）。已在回覆用 `window_too_small` 明示，未改時間表示法。
 
+## M2 完成紀錄（2026-10-12）
+
+W4（`mode="summary"`）與 W1（`list_series detail=true`）已實作，契約測試擴充到 **123 項檢查**（同一支 `mcp_test.py`，對部署環境 3.13.3 實測全過）。
+
+### W4 摘要模式
+
+`get_window` 新增 `mode="summary"` + `group_by`（只在該模式有效，該模式也必須給）：
+
+| `group_by` | 一列代表 | 欄位 | 排序 |
+|---|---|---|---|
+| `transition` | 一個 `(from, to)` 轉移 | `count`、`held_min_s` / `held_median_s` / `held_max_s` | 次數多的在前 |
+| `value` | 一個值 | `count`、`seconds`（該值在窗內佔用的總時間） | 佔用時間長的在前 |
+
+- `min_duration` 先套用再分組（去抖後的段才是分組輸入），`held_seconds` 屬**新值**（`to`）的語意不變。
+- 摘要是**歸約**，所以 `max_points`（預設 500）改成限制**群組列數**而非段數：`group_count` 永遠是完整群組數，超預算才截斷並標 `groups_truncated`。這是「裝不下就轉 dense」唯一的例外，已寫進 schema 描述。
+- 空窗仍回 `groups: []` + `window_too_small`。
+
+### W1 事實層
+
+`list_series detail=true` 時每檔多一個 `facts`（鍵為訊號名）：
+
+| 欄位 | 意義 |
+|---|---|
+| `distinct` | 該欄相異值數（`SeriesState.distinct_count`，與 `kind` 同一個來源） |
+| `changes` | 整檔變化次數（`_change_facts`，與 `find_changes` 同一個來源） |
+| `constant` | 只在從不變化時出現（`changes == 0`） |
+| `duplicate_of` | 值序列完全相同時，指向該等價類**最早**的那一欄 |
+| `same_timing_as` | 變化位置完全相同但值不同（最多 8 個，`same_timing_count` 給總數） |
+| `value_pairs` | 與某個同步訊號之間的**一對一**值對應（≤32 筆），`with` 說明對象 |
+
+- 時序同步用每欄變化遮罩的 16-byte blake2b 摘要分組（兩兩比對遮罩是 columns² × samples 的作法）。`changes` / `constant_columns` / `same_timing_as` 全部走 M1 的 `_changed_counts` 家族，不會與 `find_changes` 漂移。
+- **只有會變化的欄才進分組**：常數欄的變化遮罩全空、摘要相同，若一起分組會變成一坨假群組。
+- 事實層（含關係）與 `file_stats_cache` 一起快取，失效點同 M1（`load_csv_files` / `remove_file` / `remove_all_files` / `create_computed_series`）。
+
+### 驗證
+
+- 契約測試 `mcp_test.py`：**123/123**。
+- W4 對真實資料：`mpc_ctrl_mode` 全檔在 101 檔與 105 檔**都是 14 組**、`playing→halt` 都是 **3**；每一組的 count / min / median / max 與同一窗 `mode="transitions"` 的精確列**逐組相符**（測試自己做同一份歸約再比對，不是拿伺服器的輸出比伺服器的輸出）；`group_by="value"` 的每值次數與秒數同樣與精確列相符，秒數總和等於窗長，且群組依佔用時間遞減。
+- 場長（`held_seconds` 屬新值，所以場長＝進入 `playing` 那一列的 held）：101 檔 78 場、正常 350.260–351.457 s；105 檔 76 場、正常 349.852–351.847 s —— 與本檔五檔表一致。
+- W1 對真實資料（105 檔）：`duplicate_of` 抓到 14 組別名（`mpc_ctrl_t_elapsed` 與 `mpc_ctrl_t_replay_left` ≡ `mpc_ctrl_t_play`；`mpc_ctrl_over_travel_2` ≡ `_1`；`mpc_ctrl_cali_2` ≡ `_1`；`mpc_ctrl_run_2` ≡ `_1`；`hal_pose_home_1/2/3` ≡ `mpc_ctrl_home_1/2/3`…），`mpc_ctrl_state` ↔ `mpc_ctrl_mode` 判為同時序非重複，並給出值對應 `[[8,"playing"],[12,"halt"],[7,"ready"],[9,"playing_done"],[10,"parking"],[2,"manual"],[1,"shutdown"]]`。
+- **上述主張都用 pandas 逐元素獨立驗過**（另一支不 import logplot 的腳本）：`t_play`/`t_elapsed`/`t_replay_left` 位置與值全同（280 141 段）、`over_travel_1/2` 全同、`cali_1/2` 全同、`mpc_ctrl_home_1` 與 `hal_pose_home_1` 全同；`state` vs `mode` 位置同、值不同；`over_travel_1` vs `_3` 位置與值都不同（伺服器也確實沒把 `_3` 標成別名）。101 檔的 `over_travel_1/2`（33 / 11 段）與 `cali_1/2`（3 / 17 段）值不同，伺服器同樣沒標 —— 正面與反面都對得上。
+- `over_travel_3` 未被標成別名、重複項不會同時出現在 `same_timing_as`、關係不會自我指向、常數欄不會被說成同步：都由契約測試逐項檢查。
+- 效能（冷啟動、真 C engine、5 檔共 1.1M 列）：`load_files` 8.4 s（解析為主）、`list_files`（掃描已由載入時的 `_describe_file` 觸發，故回 0.01 s）、`list_series` 首次（觸發每欄相異值計數）105 檔 118 ms、`list_series detail=true` 首次（含關係）105 檔 **40 ms** / 205 欄的 104 檔 **37 ms**、重複呼叫 17–24 ms。W1 的「五檔皆 <0.3 s」達標。
+  - 關係計算原本是 289–325 ms／檔：`mpc_ctrl_t_play` 這類計數器有 280 141 段，Python list 逐值比較的成本全壓在這裡。改成在同一位置比較 numpy 切片（`_runs_equal`，`equal_nan=True`）後降到 37–40 ms。
+
+### 順手發現
+
+- `transitions` 回覆是**每段一列**（首列 `from=null`），所以列數＝段數、變化數＝列數 − 1。M1 紀錄把「`playing → halt` @ 07:37:20.308 held 27.388927 s」寫成一句容易誤讀：`held_seconds` 屬於**新值**，27.388927 s 其實是**前一列**（`ready→playing`，07:36:52.919 起）的 held，也就是那一場的播放長度；`playing→halt` 那列的 held 是 `halt` 被持有的時間。
+- 因此該處 27.388927 / 28.651019 是 **101 檔**的值；105 檔同三場是 27.387970 / 28.649919 / 287.684010。兩台控制器記錄同一現場事件差約 1 ms，正好對上 suggest.md「同一現場事件、兩台控制器各自記錄」的推論。
+- suggest.md 說 `t_play`/`t_elapsed`/`t_replay_left`「變更數完全相同」是對的，但實際更強：兩檔裡這三欄的**值序列也完全相同**，所以判為 `duplicate_of` 而非「僅同時序」。
+
 ## 待辦
 
 - [x] **M1 — 低風險（2026-10-12 完成）**：W7 家務／語意修正、W8 背壓、W10 載入透明度、W11 契約測試
-- [ ] **M2 — 分析層主力**：W4 `mode="summary"`、W1 `list_series detail`
+- [x] **M2 — 分析層主力（2026-10-12 完成）**：W4 `mode="summary"`、W1 `list_series detail`
 - [ ] **M3 — 覆議後動工**：W6' `find_text`、W3 多欄與快照、W5 `mode="aggregate"`
 - [ ] **M4 — Phase 3 UI 操作**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
 

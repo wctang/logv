@@ -15,6 +15,7 @@ import sys
 import random
 import os
 import json
+import hashlib
 import time
 import re
 import tempfile
@@ -57,6 +58,8 @@ MCP_MAX_WINDOW_POINTS = 500    # default segment budget for get_window
 MCP_WINDOW_POINT_CAP = 5000    # hard cap on that budget
 MCP_MAX_CHANGED_SERIES = 500   # default cap on find_changes rows
 MCP_MAX_DISTINCT_VALUES = 20   # cap on the value distribution of a dense string window
+MCP_MAX_VALUE_PAIRS = 32       # cap on the value correspondences list_series reports
+MCP_MAX_RELATED_SERIES = 8     # cap on the same-timing names list_series reports per column
 MCP_MAX_PENDING_CALLS = 8      # more than this many calls queued for the GUI thread -> 'server busy'
 MCP_TIMESTAMP_MIN_NS = 631152000 * 1_000_000_000    # 1990-01-01: below this a parse is suspect
 MCP_TIMESTAMP_MAX_NS = 4102444800 * 1_000_000_000   # 2100-01-01: and above it likewise
@@ -435,25 +438,59 @@ def getOffsetFromUtc():
     return utc_offset
 
 
-def _changed_counts(window):
-    """Per column, how many samples differ from the previous one. NaN vs NaN did not change.
+def _unchanged_mask(values):
+    """Per adjacent pair: True where a sample repeats the one before it.
 
-    Comparing column by column keeps each in its native dtype; going through to_numpy() on
-    the whole frame would box 40M+ elements into a single object array. This is the same rule
-    find_changes answers with, so a column count of 0 here means find_changes calls it
-    unchanged over the same rows.
+    NaN against NaN counts as unchanged, in object columns just as in numeric ones, so a whole
+    run of blanks is one run rather than many. This is the only place the rule lives: the
+    segment list, find_changes and list_series' per-column facts all read it.
     """
-    if len(window) < 2:
-        return np.zeros(window.shape[1], dtype=np.int64)
-    shifted = window.shift()
-    changed = ~(window.eq(shifted) | (window.isna() & shifted.isna()))
-    changed.iloc[0] = False                # nothing precedes the first sample
-    return changed.sum().to_numpy()
+    if len(values) < 2:
+        return np.empty(0, dtype=bool)
+    current, previous = values[1:], values[:-1]
+    both_blank = pd.isna(current) & pd.isna(previous)
+    if values.dtype.kind in "OUS":
+        return both_blank | (current == previous)
+    numbers = values.astype(float)
+    return both_blank | (numbers[1:] == numbers[:-1])
+
+
+def _segment_starts(values):
+    """Positions where a sample differs from the previous one; the first sample always does.
+
+    len(result) - 1 is therefore the number of changes in the column.
+    """
+    if len(values) == 0:
+        return np.empty(0, dtype=int)
+    return np.flatnonzero(np.concatenate(([True], ~_unchanged_mask(values))))
+
+
+def _change_facts(window):
+    """Per column, in column order: how many changes, and a digest of *where* they are.
+
+    The count is what find_changes reports (0 means it calls the column unchanged over these
+    rows). The digest lets columns that change on exactly the same samples be grouped without
+    comparing the masks pairwise, which would cost columns^2 * samples.
+    """
+    counts, digests = [], []
+    for i in range(window.shape[1]):
+        changed = ~_unchanged_mask(window.iloc[:, i].to_numpy())
+        counts.append(int(np.count_nonzero(changed)))
+        digests.append(hashlib.blake2b(np.packbits(changed).tobytes(), digest_size=16).hexdigest())
+    return counts, digests
+
+
+def _changed_counts(window):
+    """Just the change counts of _change_facts, in column order."""
+    return _change_facts(window)[0]
 
 
 def _scan_loaded_file(df):
-    """Per-file facts that need a pass over every column: the sampling interval, the largest
-    gap, and the columns that never change value (blank counts as a value, as in find_changes)."""
+    """The per-file facts that need a pass over every column.
+
+    Sampling interval and largest gap come from the index; the change counts say which columns
+    never move; the signatures group the columns that move on exactly the same samples.
+    """
     index = df.index.to_numpy()
     if len(index) > 1:
         gaps = np.diff(index) / 1e9
@@ -461,10 +498,21 @@ def _scan_loaded_file(df):
     else:
         sampling_median_s = largest_gap_s = None
 
-    counts = _changed_counts(df)
-    constant = [str(col) for col, count in zip(df.columns, counts) if count == 0]
-    return {"sampling_median_s": sampling_median_s, "largest_gap_s": largest_gap_s,
-            "constant_count": len(constant), "constant_columns": constant}
+    counts, signatures = _change_facts(df)
+    names = [str(col) for col in df.columns]
+    constant = [name for name, count in zip(names, counts) if count == 0]
+    return {
+        "sampling_median_s": sampling_median_s,
+        "largest_gap_s": largest_gap_s,
+        "constant_count": len(constant),
+        "constant_columns": constant,
+        "changes": dict(zip(names, counts)),        # the rest is for list_series detail
+        "signatures": dict(zip(names, signatures)),
+    }
+
+
+# What list_files reports out of that scan; list_series detail uses the two extra keys.
+_FILE_SUMMARY_KEYS = ("sampling_median_s", "largest_gap_s", "constant_count", "constant_columns")
 
 
 class CSVPlotViewer(QMainWindow):
@@ -1104,13 +1152,25 @@ class CSVPlotViewer(QMainWindow):
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         return "inferred"
 
-    def file_summary_stats(self, path):
-        """The slow per-file facts, scanned once per load and then cached."""
+    def file_scan(self, path):
+        """The full per-file scan, computed once per load and cached."""
         cached = self.file_stats_cache.get(path)
         if cached is None:
             cached = _scan_loaded_file(self.dataframes[path])
             self.file_stats_cache[path] = cached
         return cached
+
+    def file_relations(self, path):
+        """The per-series relations, computed on demand and kept with the scan it derives from."""
+        scan = self.file_scan(path)
+        if "relations" not in scan:
+            scan["relations"] = _series_relations(self.dataframes[path], scan)
+        return scan["relations"]
+
+    def file_summary_stats(self, path):
+        """The part of that scan list_files reports; list_series detail reads the rest."""
+        scan = self.file_scan(path)
+        return {key: scan[key] for key in _FILE_SUMMARY_KEYS}
 
     def load_signallist_files(self, file_paths, file_item):
         signallist = {}
@@ -2274,22 +2334,103 @@ def _json_value(value):
     return value
 
 
-def _segment_starts(values):
-    """Positions where a sample differs from the previous one; NaN vs NaN counts as unchanged.
+def _run_values(values):
+    """The values a column holds, one per run, as a plain array (blank is still blank here)."""
+    return values[_segment_starts(values)]
 
-    The first sample always starts a segment, so len(result) - 1 is the number of changes.
-    A run of blanks (NaN in an object column, or in a numeric one) is one segment, not many.
+
+def _runs_equal(left, right):
+    """Whether two columns hold the same value in every run.
+
+    Columns that changed on the same samples have the same number of runs, so this is the
+    whole value-equality test. Doing it in numpy matters: a counter column can have hundreds
+    of thousands of runs, and Python-level comparison of that many values is not free.
     """
-    if len(values) == 0:
-        return np.empty(0, dtype=int)
-    current, previous = values[1:], values[:-1]
-    both_blank = pd.isna(current) & pd.isna(previous)
-    if values.dtype.kind in "OUS":
-        same = both_blank | (current == previous)
-    else:
-        numbers = values.astype(float)
-        same = both_blank | (numbers[1:] == numbers[:-1])
-    return np.flatnonzero(np.concatenate(([True], ~same)))
+    if left.shape != right.shape:
+        return False
+    if left.dtype.kind in "OUS" or right.dtype.kind in "OUS":
+        return all((x == y) or (pd.isna(x) and pd.isna(y)) for x, y in zip(left, right))
+    return bool(np.array_equal(left, right, equal_nan=True))
+
+
+_MISSING = object()
+
+
+def _value_pairs(own_runs, candidates, runs):
+    """The value correspondence with the first candidate whose values line up one-to-one.
+
+    Functional in the loose sense: every value this series holds picks out exactly one value
+    of the other, over at most MCP_MAX_VALUE_PAIRS pairs. Reported as observed pairs and
+    nothing more -- whether the pair list is a code table is for the caller to decide.
+    """
+    for other in candidates:
+        pairs, index, clear = [], {}, True
+        for mine, theirs in zip(own_runs, runs[other]):
+            key = _json_value(mine)
+            try:
+                seen = index.get(key, _MISSING)
+            except TypeError:            # unhashable value in an object column
+                clear = False
+                break
+            if seen is _MISSING:
+                if len(pairs) >= MCP_MAX_VALUE_PAIRS:
+                    clear = False
+                    break
+                index[key] = theirs
+                pairs.append([key, _json_value(theirs)])
+            elif seen != theirs:
+                clear = False
+                break
+        if clear and pairs:
+            return {"with": other, "pairs": sorted(pairs, key=lambda pair: str(pair[0]))}
+    return None
+
+
+def _series_relations(df, scan):
+    """Which series move on exactly the same samples, which repeat another's values, and how
+    the values of two synchronised series correspond.
+
+    Timing comes from the per-column change signature, so only columns that do change can be
+    grouped -- a constant column shares no timing with anything, and grouping it with the other
+    constants would be noise. Column order decides the rest: the earliest member of a
+    value-equality class is the one worth keeping, and the first candidate whose values line up
+    one-to-one supplies value_pairs.
+    """
+    names = [str(col) for col in df.columns]
+    order = {name: position for position, name in enumerate(names)}
+
+    groups = {}
+    for name in names:
+        if scan["changes"][name]:            # constant columns share no timing with anything
+            groups.setdefault(scan["signatures"][name], []).append(name)
+
+    relations = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        runs = {name: _run_values(df.iloc[:, order[name]].to_numpy()) for name in members}
+
+        keepers = []                         # (name, run values) of each class met so far
+        for name in members:
+            entry = {"same_timing_count": len(members) - 1}
+            keeper = next((k for k, values in keepers if _runs_equal(values, runs[name])), None)
+            if keeper is None:
+                keepers.append((name, runs[name]))
+            else:
+                entry["duplicate_of"] = keeper
+            relations[name] = entry
+
+        for name in members:
+            synced = [other for other in members
+                      if other != name and not _runs_equal(runs[other], runs[name])]
+            if synced:
+                relations[name]["same_timing_as"] = synced[:MCP_MAX_RELATED_SERIES]
+                if len(synced) > MCP_MAX_RELATED_SERIES:
+                    relations[name]["same_timing_truncated"] = True
+            pairs = _value_pairs(runs[name], synced, runs)
+            if pairs:
+                relations[name]["value_pairs"] = pairs
+    return relations
 
 
 def _viewer_tz(utc_offset):
@@ -2423,7 +2564,14 @@ class McpBridge(QObject):
             "string_series, plus which ones are currently plotted. Each name also has a 'kind' "
             "describing how the viewer draws it: 'analog' (main axis), 'enum' (a lane on the "
             "right axis, few distinct values) or 'text' (free text: tracked and searchable but "
-            "never plotted). These names are what the other tools take as 'column'.",
+            "never plotted). These names are what the other tools take as 'column'. With "
+            "detail=true each name also gets facts: 'distinct' (how many values it holds), "
+            "'changes' (how many times it moved), 'constant' (set when it never moved, so it "
+            "carries no information), 'duplicate_of' (another series holding the very same "
+            "values), 'same_timing_as' (series that moved on exactly the same samples with "
+            "different values) and 'value_pairs' (how the values of this series and one of "
+            "those correspond, when that correspondence is one-to-one). Those facts are "
+            "structure only: nothing here claims to know what a value means.",
             {
                 "type": "object",
                 "properties": {
@@ -2431,7 +2579,12 @@ class McpBridge(QObject):
                         "type": "string",
                         "description": "One loaded file, by path as reported by list_files or by a "
                                        "unique basename. Omit to list every loaded file.",
-                    }
+                    },
+                    "detail": {
+                        "type": "boolean",
+                        "description": "Also report the per-series facts above. Costs one pass "
+                                       "over every column the first time a file is asked for.",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -2473,11 +2626,17 @@ class McpBridge(QObject):
             "[time, value] segments, each value holding until the next segment and the last "
             "until t2, which is exact and complete whenever the signal changes few times. "
             "mode 'transitions' returns one row per change instead ([time, from, to, "
-            "held_seconds]). min_duration drops runs shorter than N seconds in either mode and "
-            "drop_dominant keeps only the runs that are not the value holding the most time -- "
-            "both turn per-second jitter into the events that matter. If what is left does not "
-            "fit max_points the reply becomes a bounded summary (mode 'dense', with stats and a "
-            "value distribution for low-cardinality signals). A window reaching past the last "
+            "held_seconds]). mode 'summary' groups the window's runs instead of listing them: "
+            "group_by 'transition' gives one row per (from, to) pair with how often it happened "
+            "and how long it was held (min/median/max), group_by 'value' gives one row per value "
+            "with how often and how long it was held. That is how a state machine's cycles get "
+            "counted without the caller fetching every run. min_duration drops runs shorter than "
+            "N seconds in any mode and drop_dominant keeps only the runs that are not the value "
+            "holding the most time -- both turn per-second jitter into the events that matter. If "
+            "what is left does not fit max_points the reply becomes a bounded summary (mode "
+            "'dense', with stats and a value distribution for low-cardinality signals); a "
+            "'summary' reply is already a reduction, so there the budget caps the group rows "
+            "instead and groups_truncated says when it bit. A window reaching past the last "
             "sample is clamped to it and flagged held_truncated.",
             {
                 "type": "object",
@@ -2495,13 +2654,16 @@ class McpBridge(QObject):
                            "description": "Window end (inclusive), same formats as t1."},
                     "max_points": {"type": "integer",
                                    "description": f"Budget, default {MCP_MAX_WINDOW_POINTS}, "
-                                                  f"max {MCP_WINDOW_POINT_CAP}."},
+                                                  f"max {MCP_WINDOW_POINT_CAP}. Caps group rows "
+                                                  f"in 'summary' mode."},
                     "mode": {"type": "string",
-                             "description": "'segments' (default) or 'transitions'."},
+                             "description": "'segments' (default), 'transitions' or 'summary'."},
+                    "group_by": {"type": "string",
+                                 "description": "'transition' or 'value', required by mode "
+                                                "'summary' and only used there."},
                     "min_duration": {"type": "number",
                                      "description": "Drop runs shorter than this many seconds, in "
-                                                    "both 'segments' and 'transitions' mode. "
-                                                    "Default 0 = keep every change."},
+                                                    "every mode. Default 0 = keep every change."},
                     "drop_dominant": {"type": "boolean",
                                       "description": "Only keep runs whose value is not the one "
                                                      "holding the most time (mode 'segments' only)."},
@@ -2599,6 +2761,7 @@ class McpBridge(QObject):
 
     def _tool_list_series(self, args):
         requested = args.get("file")
+        detail = bool(args.get("detail", False))
         if requested is None or requested == "":
             targets = list(self.viewer.dataframes)
         elif not isinstance(requested, str):
@@ -2610,6 +2773,9 @@ class McpBridge(QObject):
         for path in targets:
             df = self.viewer.dataframes[path]
             numeric, strings, plotted, tracked, labels, kinds = [], [], [], [], {}, {}
+            facts = {}
+            scan = self.viewer.file_scan(path) if detail else None
+            relations = self.viewer.file_relations(path) if detail else {}
             truncated = False
 
             for col in df.columns:
@@ -2622,6 +2788,16 @@ class McpBridge(QObject):
                     strings.append(name)
                 else:
                     numeric.append(name)
+                if detail:
+                    changes = scan["changes"].get(name)
+                    fact = dict(relations.get(name, {}))
+                    if changes is not None:
+                        fact["changes"] = changes
+                        if changes == 0:
+                            fact["constant"] = True
+                    if ss is not None:
+                        fact["distinct"] = ss.distinct_count
+                    facts[name] = fact
                 if ss is None:
                     continue
                 kinds[name] = ss.kind          # how the viewer draws it
@@ -2646,6 +2822,8 @@ class McpBridge(QObject):
                 entry["labels"] = labels
             if kinds:
                 entry["kinds"] = kinds
+            if detail:
+                entry["facts"] = facts
             files.append(entry)
         return {"files": files}
 
@@ -2759,8 +2937,14 @@ class McpBridge(QObject):
                                         "max_points", MCP_WINDOW_POINT_CAP)
 
         mode = args.get("mode", "segments")
-        if mode not in ("segments", "transitions"):
-            raise ValueError("'mode' must be 'segments' or 'transitions'")
+        if mode not in ("segments", "transitions", "summary"):
+            raise ValueError("'mode' must be 'segments', 'transitions' or 'summary'")
+        group_by = args.get("group_by")
+        if mode == "summary":
+            if group_by not in ("transition", "value"):
+                raise ValueError("'group_by' must be 'transition' or 'value' with mode 'summary'")
+        elif group_by is not None:
+            raise ValueError("'group_by' only applies to mode 'summary'")
         drop_dominant = bool(args.get("drop_dominant", False))
         if drop_dominant and mode != "segments":
             raise ValueError("'drop_dominant' only applies to mode 'segments'")
@@ -2784,8 +2968,14 @@ class McpBridge(QObject):
                "samples": int(len(values))}
         if len(values) == 0:
             out["mode"] = mode
-            out[mode] = []
             out["window_too_small"] = True
+            if mode == "summary":
+                out["group_by"] = group_by
+                out["segments"] = 0
+                out["transitions"] = 0
+                out["groups"] = []
+            else:
+                out[mode] = []
             return out
 
         last_sample = float(index[-1]) / 1e9
@@ -2813,6 +3003,9 @@ class McpBridge(QObject):
                 out["segments_before"] = int(len(times))
             times, seg_values = _merge_equal_runs(times[kept], seg_values[kept])
         ends = np.append(times[1:], window_end)      # ... and ends where the next one starts
+
+        if mode == "summary":
+            return self._summary_window(out, times, ends, seg_values, group_by, max_points)
 
         if drop_dominant:
             held = {}
@@ -2843,6 +3036,56 @@ class McpBridge(QObject):
 
         out["mode"] = "segments"
         out["segments"] = [[fmt(t), _json_value(v)] for t, v in zip(times, seg_values)]
+        return out
+
+    def _summary_window(self, out, times, ends, seg_values, group_by, max_points):
+        """Group a window's runs by the transition into them, or by the value held.
+
+        This is a reduction, so the max_points budget limits the number of group *rows* rather
+        than the number of runs: unless groups_truncated is set, the totals are exact for the
+        window, which is the whole point -- counting cycles should not need the caller to
+        fetch every run first.
+        """
+        spans = ends - times
+        out["mode"] = "summary"
+        out["group_by"] = group_by
+        out["segments"] = int(len(times))
+        out["transitions"] = int(len(times) - 1)
+
+        if group_by == "value":
+            groups = {}
+            for value, span in zip(seg_values, spans):
+                key = str(_json_value(value))
+                entry = groups.setdefault(key, {"value": _json_value(value), "count": 0,
+                                                "seconds": 0.0})
+                entry["count"] += 1
+                entry["seconds"] += float(span)
+            rows = sorted(groups.values(), key=lambda row: (-row["seconds"], str(row["value"])))
+            for row in rows:
+                row["seconds"] = round(row["seconds"], 6)
+        else:
+            groups = {}
+            for i, span in enumerate(spans):
+                to = _json_value(seg_values[i])
+                frm = _json_value(seg_values[i - 1]) if i else None
+                entry = groups.setdefault((str(frm), str(to)),
+                                          {"from": frm, "to": to, "count": 0, "held": []})
+                entry["count"] += 1
+                entry["held"].append(float(span))
+            rows = []
+            for entry in groups.values():
+                held = sorted(entry.pop("held"))
+                entry["held_min_s"] = round(held[0], 6)
+                entry["held_median_s"] = round(float(np.median(held)), 6)
+                entry["held_max_s"] = round(held[-1], 6)
+                rows.append(entry)
+            rows.sort(key=lambda row: (-row["count"], str(row["from"]), str(row["to"])))
+
+        out["group_count"] = len(rows)
+        if len(rows) > max_points:
+            out["groups_truncated"] = True
+            rows = rows[:max_points]
+        out["groups"] = rows
         return out
 
     def _dense_window(self, out, values, index, times, fmt):
