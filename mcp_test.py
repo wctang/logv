@@ -13,6 +13,7 @@ Needs no dependency beyond the stdlib; exits non-zero if any check fails.
 import itertools
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -199,12 +200,12 @@ def main():
     check("one sample still reports the value",
           len(single["segments"]) == 1, json.dumps(single)[:300])
 
-    # Unix seconds are floats: a t1 == t2 probe can land beside the sample instead of on it.
-    # Whatever happens, the reply has to say the window was too small.
-    probe = call("get_window", {"file": f["file"], "column": "mpc_ctrl_mode",
-                                "t1": f["end"], "t2": f["end"]})
-    check("t1 == t2 -> window_too_small either way", probe.get("window_too_small") is True,
-          json.dumps(probe)[:300])
+    # M3 turned t1 == t2 into a snapshot (the last sample at or before t2), so asking for
+    # segments explicitly is now the only way to see the old "one instant is too small" answer.
+    explicit = call("get_window", {"file": f["file"], "column": "mpc_ctrl_mode",
+                                   "t1": f["end"], "t2": f["end"], "mode": "segments"})
+    check("explicit segments still flags a one-instant window",
+          explicit.get("window_too_small") is True, json.dumps(explicit)[:300])
 
     roomy = call("get_window", {"file": f["file"], "column": "mpc_ctrl_mode",
                                 "t1": f["end"] - 60, "t2": f["end"]})
@@ -433,6 +434,204 @@ def main():
                    "mpc_ctrl_curr_motion_signature"):
         if column in facts105:
             print(f"       {column}: {json.dumps(facts105[column])}")
+
+    print("\n[W3] snapshot and multi-column reads")
+    aborts = [row for row in whole_window(f105, mode="transitions")["transitions"]
+              if row[1] == "playing" and row[2] == "halt"]
+    check("105 has three playing->halt rows", len(aborts) == 3, len(aborts))
+    instant = aborts[0][0] + 0.001        # 1 ms past the halt, safely inside that sample
+
+    def find_name(suffix):
+        found = sorted(n for n in facts105 if n == suffix or n.endswith("_" + suffix))
+        return found[0] if found else None
+
+    fingerprint = [name for name in ("mpc_ctrl_mode", "mpc_ctrl_state", find_name("t_play"),
+                                     find_name("run_1"), find_name("st_1"), find_name("en_1"),
+                                     "alarm_data") if name]
+    check("the abort fingerprint signals all exist", len(fingerprint) == 7, fingerprint)
+    print(f"    -> snapshot columns: {fingerprint}")
+
+    snap = call("get_window", {"file": f105["file"], "columns": fingerprint,
+                              "t1": instant, "t2": instant})
+    entries = {entry["column"]: entry for entry in snap["columns"]}
+    check("one call reads all seven", len(entries) == len(fingerprint), list(entries))
+    check("t1 == t2 gives a snapshot",
+          all(entry["mode"] == "snapshot" for entry in entries.values()),
+          [entry["mode"] for entry in entries.values()])
+    check("every column reports the same sample",
+          len({entry["sample_time"] for entry in entries.values()}) == 1,
+          {e["column"]: e["sample_time"] for e in entries.values()})
+    check("mode is halt and state is 12 at the abort",
+          entries["mpc_ctrl_mode"]["value"] == "halt" and entries["mpc_ctrl_state"]["value"] == 12,
+          {name: entries[name]["value"] for name in ("mpc_ctrl_mode", "mpc_ctrl_state")})
+    check("alarm_data carries the halt command",
+          "Halt command received" in str(entries["alarm_data"]["value"]),
+          str(entries["alarm_data"]["value"])[:160])
+    check("t_play is back to zero at the abort",
+          entries[find_name("t_play")]["value"] == 0, entries[find_name("t_play")]["value"])
+    print(f"    -> {json.dumps({name: entry['value'] for name, entry in entries.items()})[:400]}")
+
+    check("an explicit snapshot mode works away from t1 == t2",
+          call("get_window", {"file": f105["file"], "column": "mpc_ctrl_mode", "mode": "snapshot",
+                              "t1": instant - 600, "t2": instant})["value"] == "halt", "")
+    check("a snapshot before the first sample says so",
+          call("get_window", {"file": f105["file"], "column": "mpc_ctrl_mode",
+                              "t1": f105["start"] - 3600, "t2": f105["start"] - 3600}
+               ).get("no_sample") is True, "")
+    check("giving both column and columns is an error",
+          "__error__" in call("get_window", {"file": f105["file"], "column": "mpc_ctrl_mode",
+                                             "columns": ["mpc_ctrl_state"],
+                                             "t1": instant, "t2": instant}), "")
+    check("an unknown name in columns is an error",
+          "__error__" in call("get_window", {"file": f105["file"], "columns": ["mpc_ctrl_mode", "nope"],
+                                             "t1": instant, "t2": instant}), "")
+    multi = call("get_window", {"file": f105["file"],
+                                "columns": ["mpc_ctrl_mode", "mpc_ctrl_state"],
+                                "t1": f105["start"] - 1, "t2": f105["end"] + 1,
+                                "mode": "summary", "group_by": "value"})
+    check("columns works for other modes too",
+          len(multi["columns"]) == 2
+          and all(entry["group_count"] == 7 for entry in multi["columns"]),
+          [entry.get("group_count") for entry in multi["columns"]])
+
+    print("\n[W5] mode=aggregate")
+    t_play = find_name("t_play")
+    # A play runs about 350 s and the counter keeps its value when one completes normally, so
+    # the shape to look for is the abort: five minutes spanning abort C's whole play, where the
+    # counter climbs to 81.6 % of the full length and the halt zeroes it.
+    instant_c = aborts[2][0]
+    rows = whole_window(f105, mode="transitions")["transitions"]
+    c_start = max(row[0] for row in rows if row[2] == "playing" and row[0] < instant_c)
+    aggregate = call("get_window", {"file": f105["file"], "column": t_play, "mode": "aggregate",
+                                    "every": 10, "t1": c_start + 10, "t2": c_start + 310})
+    buckets = aggregate["buckets"]
+    maxima = [row["max"] for row in buckets]
+    check("buckets span the window in one step",
+          29 <= aggregate["bucket_count"] <= 31, aggregate["bucket_count"])
+    check("bucket counts add up to the window's samples",
+          sum(row["count"] for row in buckets) == aggregate["samples"],
+          f"{sum(row['count'] for row in buckets)} vs {aggregate['samples']}")
+    check("buckets start on multiples of every since the epoch",
+          all(row["t"] % 10 == 0 for row in buckets), [row["t"] for row in buckets[:4]])
+    check("every aggregate brackets the first and last sample of its bucket",
+          all(row["min"] <= row[key] <= row["max"]
+              for row in buckets for key in ("first", "last") if key in row),
+          json.dumps([row for row in buckets
+                      if not (row["min"] <= row["last"] <= row["max"])])[:300])
+    check("the climb starts from near zero", buckets[0]["min"] < 20000, buckets[0])
+    peak = max(range(len(buckets)), key=lambda i: maxima[i])
+    check("the counter climbs without ever falling back",
+          all(maxima[i] <= maxima[i + 1] for i in range(peak)),
+          [(maxima[i], maxima[i + 1]) for i in range(peak) if maxima[i] > maxima[i + 1]][:3])
+    check("it reaches 81.6 % of the full length, not the full 346 s",
+          280000 <= maxima[peak] <= 295000, maxima[peak])
+    check("the halt zeroes it by the end of the window",
+          buckets[-1]["last"] == 0 and buckets[-1]["max"] == 0, buckets[-1])
+    print(f"    -> {aggregate['bucket_count']} buckets of {aggregate['every']}s: "
+          f"first {buckets[0]}, peak {maxima[peak]} at bucket {peak}, last {buckets[-1]}")
+
+    check("agg picks which aggregates come back",
+          set(call("get_window", {"file": f105["file"], "column": t_play, "mode": "aggregate",
+                                  "every": 30, "agg": ["last"],
+                                  "t1": play_start + 60, "t2": play_start + 360})["buckets"][0])
+          == {"t", "count", "last"}, "")
+    check("aggregate needs every",
+          "__error__" in call("get_window", {"file": f105["file"], "column": t_play,
+                                             "mode": "aggregate", "t1": 0, "t2": 4e9}), "")
+    check("every only applies to aggregate",
+          "__error__" in call("get_window", {"file": f105["file"], "column": t_play,
+                                             "every": 10, "t1": 0, "t2": 4e9}), "")
+    check("agg is validated",
+          "__error__" in call("get_window", {"file": f105["file"], "column": t_play,
+                                             "mode": "aggregate", "every": 10, "agg": ["mean"],
+                                             "t1": 0, "t2": 4e9}), "")
+    check("aggregate is numeric only",
+          "__error__" in call("get_window", {"file": f105["file"], "column": "mpc_ctrl_mode",
+                                             "mode": "aggregate", "every": 10, "t1": 0, "t2": 4e9}), "")
+    check("min_duration does not apply to aggregate",
+          "__error__" in call("get_window", {"file": f105["file"], "column": t_play,
+                                             "mode": "aggregate", "every": 10, "min_duration": 1,
+                                             "t1": 0, "t2": 4e9}), "")
+    too_fine = call("get_window", {"file": f105["file"], "column": t_play, "mode": "aggregate",
+                                   "every": 0.5, "t1": play_start, "t2": play_start + 360})
+    check("too many buckets is an argument error, not a silent truncation",
+          "__error__" in too_fine and "every" in too_fine["__error__"], too_fine)
+
+    print("\n[W6'] find_text")
+    halt = call("find_text", {"pattern": "Halt command received"})
+    hits = {(os.path.basename(entry["file"]), entry["column"]): entry for entry in halt["series"]}
+    check("the halt text is found in alarm_data of both controllers",
+          ("log-20260101.log_mpc_ctrl_105.csv.zst", "alarm_data") in hits
+          and ("log-htb-20260101.log_mpc_ctrl_101.csv.zst", "alarm_data") in hits, sorted(hits))
+    alarm = hits.get(("log-20260101.log_mpc_ctrl_105.csv.zst", "alarm_data"), {})
+    check("the matched value is the text that was asked for",
+          any("Halt command received" in value for value in alarm.get("values", [])),
+          str(alarm.get("values"))[:200])
+    check("a pattern nothing contains finds nothing",
+          call("find_text", {"pattern": "no-such-text-anywhere-42"})["matches_found"] == 0, "")
+
+    # The message log holds no "Halt command received" (pandas says 0 rows, in any case), but
+    # it does say "halt" 37 times -- so a case-insensitive search has to find exactly those.
+    speech = call("find_text", {"pattern": "halt", "ignore_case": True,
+                                "file": files["log-20260101.log_msg_105.csv.zst"]["file"],
+                                "columns": ["msg"]})
+    check("a case-insensitive search finds the 37 halt lines pandas counts",
+          speech["matches_found"] == 37 and speech["series"][0]["column"] == "msg",
+          speech["matches_found"])
+    check("case folding is what makes them match",
+          call("find_text", {"pattern": "Halt", "file": files["log-20260101.log_msg_105.csv.zst"]["file"],
+                             "columns": ["msg"]})["matches_found"] == 0, "")
+    print(f"    -> msg log: {speech['matches_found']} hits, first {str(speech['matches'][0])[:140]}")
+
+    # The same question through a different code path: dense's value distribution counts the
+    # samples holding each distinct value, and an anchored regex must agree with it.
+    msg_file = files["log-20260101.log_msg_105.csv.zst"]
+    dense = call("get_window", {"file": msg_file["file"], "column": "msg",
+                                "t1": msg_file["start"] - 1, "t2": msg_file["end"] + 1})
+    check("a whole-file window on msg comes back dense",
+          dense["mode"] == "dense" and "values" in dense, sorted(dense))
+    top_value, top_count = max(dense["values"].items(), key=lambda item: item[1])
+    t0 = time.perf_counter()
+    anchored = call("find_text", {"pattern": "^" + re.escape(top_value) + "$", "regex": True,
+                                  "file": msg_file["file"], "columns": ["msg"]})
+    print(f"    -> anchored search over {dense['samples']} msg samples: "
+          f"{time.perf_counter() - t0:.2f} s")
+    check("an anchored regex agrees with dense's own count of that value",
+          anchored["matches_found"] == top_count,
+          f"{anchored['matches_found']} vs {top_count} for {top_value[:60]!r}")
+    check("find_text lists the hits when they fit under the limit",
+          len(anchored["matches"]) == min(anchored["matches_found"], 50),
+          f"{len(anchored['matches'])} vs {anchored['matches_found']}")
+
+    strings = set(call("list_series", {"file": f105["file"]})["files"][0]["string_series"])
+    named = call("find_text", {"pattern": "Halt", "file": f105["file"]})
+    check("only string signals are searched unless told otherwise",
+          named["series"] and all(entry["column"] in strings for entry in named["series"]),
+          sorted({entry["column"] for entry in named["series"]} - strings))
+    check("naming a column searches exactly that one",
+          call("find_text", {"pattern": "Halt", "file": f105["file"],
+                             "columns": ["alarm_data"]})["files"][0]["searched_columns"] == 1, "")
+    check("ignore_case matches other spellings",
+          call("find_text", {"pattern": "halt command", "ignore_case": True,
+                             "file": f105["file"]})["matches_found"] > 0, "")
+    check("a regex is a regex",
+          call("find_text", {"pattern": r"Halt\s+command", "regex": True,
+                             "file": f105["file"]})["matches_found"] > 0, "")
+    limited = call("find_text", {"pattern": "halt", "ignore_case": True,
+                                 "file": files["log-20260101.log_msg_105.csv.zst"]["file"],
+                                 "columns": ["msg"], "limit": 5})
+    check("limit truncates the hit list but not the count",
+          len(limited["matches"]) == 5 and limited["truncated"] is True
+          and limited["matches_found"] == 37, json.dumps(limited)[:200])
+    check("a literal pattern may contain regex characters",
+          "matches_found" in call("find_text", {"pattern": "Halt(", "regex": False}), "")
+    check("a broken regex is a clear error",
+          "__error__" in call("find_text", {"pattern": "Halt(", "regex": True}), "")
+    check("nested quantifiers are refused up front",
+          "__error__" in call("find_text", {"pattern": "(a+)+", "regex": True}), "")
+    check("an over-long pattern is refused",
+          "__error__" in call("find_text", {"pattern": "a" * 201}), "")
+    check("a missing pattern is an error", "__error__" in call("find_text", {}), "")
 
     print("\n[W8] backpressure")
     busy_file = f105["file"]

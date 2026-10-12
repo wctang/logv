@@ -60,6 +60,13 @@ MCP_MAX_CHANGED_SERIES = 500   # default cap on find_changes rows
 MCP_MAX_DISTINCT_VALUES = 20   # cap on the value distribution of a dense string window
 MCP_MAX_VALUE_PAIRS = 32       # cap on the value correspondences list_series reports
 MCP_MAX_RELATED_SERIES = 8     # cap on the same-timing names list_series reports per column
+MCP_MAX_PATTERN = 200          # longest find_text pattern accepted
+MCP_MAX_TEXT_MATCHES = 50      # default cap on the hits find_text returns
+MCP_MAX_MATCHED_VALUES = 20    # cap on the distinct matched values find_text reports per series
+MCP_TEXT_SEARCH_TIMEOUT = 5.0  # wall-clock budget for one find_text call, against runaway patterns
+MCP_AGG_KINDS = ("min", "max", "first", "last")
+# The classic catastrophic-backtracking shapes, e.g. (a+)+: refused before they ever run.
+MCP_REGEX_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*][^)]*\)[+*]")
 MCP_MAX_PENDING_CALLS = 8      # more than this many calls queued for the GUI thread -> 'server busy'
 MCP_TIMESTAMP_MIN_NS = 631152000 * 1_000_000_000    # 1990-01-01: below this a parse is suspect
 MCP_TIMESTAMP_MAX_NS = 4102444800 * 1_000_000_000   # 2100-01-01: and above it likewise
@@ -2622,58 +2629,119 @@ class McpBridge(QObject):
         )
         self._add_tool(
             "get_window",
-            "Read one signal over a time window. By default the reply is its change list: "
+            "Read signal values over a time window. By default the reply is a change list: "
             "[time, value] segments, each value holding until the next segment and the last "
             "until t2, which is exact and complete whenever the signal changes few times. "
-            "mode 'transitions' returns one row per change instead ([time, from, to, "
-            "held_seconds]). mode 'summary' groups the window's runs instead of listing them: "
-            "group_by 'transition' gives one row per (from, to) pair with how often it happened "
-            "and how long it was held (min/median/max), group_by 'value' gives one row per value "
-            "with how often and how long it was held. That is how a state machine's cycles get "
-            "counted without the caller fetching every run. min_duration drops runs shorter than "
-            "N seconds in any mode and drop_dominant keeps only the runs that are not the value "
-            "holding the most time -- both turn per-second jitter into the events that matter. If "
-            "what is left does not fit max_points the reply becomes a bounded summary (mode "
-            "'dense', with stats and a value distribution for low-cardinality signals); a "
-            "'summary' reply is already a reduction, so there the budget caps the group rows "
-            "instead and groups_truncated says when it bit. A window reaching past the last "
-            "sample is clamped to it and flagged held_truncated.",
+            "mode 'transitions' returns one row per run instead ([time, from, to, held_seconds], "
+            "the duration belonging to the new value). mode 'summary' groups the window's runs "
+            "instead of listing them: group_by 'transition' gives one row per (from, to) pair "
+            "with how often it happened and how long it was held (min/median/max), group_by "
+            "'value' one row per value with how often and how long it was held. mode "
+            "'aggregate' buckets the samples by every=N seconds and reports the requested "
+            "aggregates per bucket. mode 'snapshot' answers a single instant instead: the last "
+            "sample at or before t2, which is what t1 == t2 means and is the default then. "
+            "Pass 'columns' to read several signals in one call. min_duration drops runs shorter "
+            "than N seconds and drop_dominant keeps only the runs that are not the value holding "
+            "the most time -- both turn per-second jitter into the events that matter. If what "
+            "is left does not fit max_points the reply becomes a bounded summary (mode 'dense', "
+            "with stats and a value distribution for low-cardinality signals); 'summary' and "
+            "'aggregate' are already reductions, so there the budget caps their rows instead. A "
+            "window reaching past the last sample is clamped to it and flagged held_truncated.",
             {
                 "type": "object",
                 "properties": {
                     "file": {"type": "string",
                              "description": "Loaded file, by path or unique basename (see list_files). "
                                             "May be omitted while exactly one file is loaded."},
-                    "column": {"type": "string", "description": "Signal name (see list_series)."},
+                    "column": {"type": "string", "description": "One signal name (see list_series)."},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Several signal names at once; the reply carries one entry "
+                                       "per name under 'columns'. Give this or 'column', not both.",
+                    },
                     "t1": {"type": ["number", "string"],
                            "description": "Window start: Unix seconds, or an ISO 8601 timestamp "
                                           "read in the viewer's timezone. The window is inclusive; "
-                                          "Unix seconds are floats, so a t1 == t2 probe can land "
-                                          "beside a sample and report window_too_small."},
+                                          "t1 == t2 asks for the snapshot at that instant."},
                     "t2": {"type": ["number", "string"],
                            "description": "Window end (inclusive), same formats as t1."},
                     "max_points": {"type": "integer",
                                    "description": f"Budget, default {MCP_MAX_WINDOW_POINTS}, "
-                                                  f"max {MCP_WINDOW_POINT_CAP}. Caps group rows "
-                                                  f"in 'summary' mode."},
+                                                  f"max {MCP_WINDOW_POINT_CAP}. Caps group rows in "
+                                                  f"'summary' and buckets in 'aggregate'."},
                     "mode": {"type": "string",
-                             "description": "'segments' (default), 'transitions' or 'summary'."},
+                             "description": "'segments' (default), 'transitions', 'summary', "
+                                            "'aggregate' or 'snapshot'."},
                     "group_by": {"type": "string",
                                  "description": "'transition' or 'value', required by mode "
                                                 "'summary' and only used there."},
+                    "every": {"type": "number",
+                              "description": "Bucket width in seconds, required by mode "
+                                             "'aggregate'. Buckets start on multiples of it "
+                                             "since the epoch."},
+                    "agg": {"type": "array",
+                            "items": {"type": "string"},
+                            "description": f"Which aggregates each 'aggregate' bucket carries, out "
+                                           f"of {' / '.join(MCP_AGG_KINDS)}. Default "
+                                           f"['min', 'max', 'last']."},
                     "min_duration": {"type": "number",
-                                     "description": "Drop runs shorter than this many seconds, in "
-                                                    "every mode. Default 0 = keep every change."},
+                                     "description": "Drop runs shorter than this many seconds. "
+                                                    "Default 0 = keep every change."},
                     "drop_dominant": {"type": "boolean",
                                       "description": "Only keep runs whose value is not the one "
                                                      "holding the most time (mode 'segments' only)."},
                     "time_format": {"type": "string",
                                     "description": "'unix' (default) or 'iso' for the returned times."},
                 },
-                "required": ["column", "t1", "t2"],
+                "required": ["t1", "t2"],
                 "additionalProperties": False,
             },
             self._tool_get_window,
+        )
+        self._add_tool(
+            "find_text",
+            "Search the loaded logs for a piece of text inside signal values, the way grep "
+            "would on the raw CSV. 'pattern' is matched literally unless regex=true; "
+            "ignore_case compares case-insensitively. Without 'columns' only the string-valued "
+            "signals are searched. Every distinct value in the window is tested once, so a "
+            "column repeating one line 300 000 times costs the same as one holding it once. "
+            "Returns the matching series with their hit counts and the distinct values that "
+            "matched, plus the first 'limit' hits as [time, file, column, value]. Nothing here "
+            "knows what any text means -- pass the pattern you are looking for.",
+            {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string",
+                                "description": "Text to look for, literal unless regex=true."},
+                    "regex": {"type": "boolean",
+                              "description": "Treat 'pattern' as a Python regular expression "
+                                             "(searched, not anchored)."},
+                    "ignore_case": {"type": "boolean",
+                                    "description": "Compare without regard to case."},
+                    "file": {"type": "string",
+                             "description": "One loaded file, by path or unique basename. Omit to "
+                                            "search every loaded file."},
+                    "columns": {"type": "array",
+                                "items": {"type": "string"},
+                                "description": "Restrict the search to these signals. Omit to "
+                                               "search every string-valued signal."},
+                    "t1": {"type": ["number", "string"],
+                           "description": "Window start: Unix seconds, or an ISO 8601 timestamp "
+                                          "read in the viewer's timezone. Defaults to the start "
+                                          "of each file."},
+                    "t2": {"type": ["number", "string"],
+                           "description": "Window end (inclusive), same formats as t1. Defaults "
+                                          "to the end of each file."},
+                    "limit": {"type": "integer",
+                              "description": f"Max hits returned, default {MCP_MAX_TEXT_MATCHES}."},
+                    "time_format": {"type": "string",
+                                    "description": "'unix' (default) or 'iso' for the hit times."},
+                },
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+            self._tool_find_text,
         )
 
     # --- tools ---
@@ -2929,56 +2997,118 @@ class McpBridge(QObject):
 
     def _tool_get_window(self, args):
         path = self._resolve_file(args.get("file"), allow_default=True)
-        column = args.get("column")
-        if not isinstance(column, str) or not column:
-            raise ValueError("'column' must be a non-empty string")
+        requested = args.get("columns")
+        if requested is not None:
+            if args.get("column") is not None:
+                raise ValueError("give either 'column' or 'columns', not both")
+            if (not isinstance(requested, list) or not requested
+                    or not all(isinstance(name, str) and name for name in requested)):
+                raise ValueError("'columns' must be a non-empty list of signal names")
+            names = requested
+        else:
+            name = args.get("column")
+            if not isinstance(name, str) or not name:
+                raise ValueError("'column' must be a non-empty string, or pass 'columns'")
+            names = [name]
+
         t1, t2 = self._window_args(args)
+        fmt, _tz = self._time_formatter(args)
+        opts = self._window_options(args, t1, t2)
+
+        df = self.viewer.dataframes[path]
+        for name in names:
+            if name not in df.columns:
+                raise ValueError(f"unknown column {name!r}; call list_series(file='{path}') for the names")
+
+        replies = [self._window_one(path, df, name, t1, t2, fmt, opts) for name in names]
+        envelope = {"file": path, "t1": fmt(t1), "t2": fmt(t2),
+                    "tz": _offset_text(self.viewer.x_axis.utcOffset)}
+        if requested is None:
+            return {**envelope, **replies[0]}
+        return {**envelope, "columns": replies}
+
+    def _window_options(self, args, t1, t2):
+        """Validate the mode and its arguments once, for one column or for many."""
         max_points = self._positive_int(args.get("max_points", MCP_MAX_WINDOW_POINTS),
                                         "max_points", MCP_WINDOW_POINT_CAP)
+        mode = args.get("mode")
+        if mode is None:
+            mode = "snapshot" if t1 == t2 else "segments"   # one instant is a snapshot
+        if mode not in ("segments", "transitions", "summary", "aggregate", "snapshot"):
+            raise ValueError("'mode' must be 'segments', 'transitions', 'summary', "
+                             "'aggregate' or 'snapshot'")
 
-        mode = args.get("mode", "segments")
-        if mode not in ("segments", "transitions", "summary"):
-            raise ValueError("'mode' must be 'segments', 'transitions' or 'summary'")
         group_by = args.get("group_by")
         if mode == "summary":
             if group_by not in ("transition", "value"):
                 raise ValueError("'group_by' must be 'transition' or 'value' with mode 'summary'")
         elif group_by is not None:
             raise ValueError("'group_by' only applies to mode 'summary'")
-        drop_dominant = bool(args.get("drop_dominant", False))
-        if drop_dominant and mode != "segments":
-            raise ValueError("'drop_dominant' only applies to mode 'segments'")
+
+        every, agg = args.get("every"), args.get("agg")
+        if mode == "aggregate":
+            if isinstance(every, bool) or not isinstance(every, (int, float)) or every <= 0:
+                raise ValueError("'every' must be a positive number of seconds with mode 'aggregate'")
+            if agg is None:
+                agg = ["min", "max", "last"]
+            elif (not isinstance(agg, list) or not agg
+                  or not all(isinstance(kind, str) and kind in MCP_AGG_KINDS for kind in agg)):
+                raise ValueError(f"'agg' must be a list out of {' / '.join(MCP_AGG_KINDS)}")
+            else:
+                agg = list(dict.fromkeys(agg))       # drop repeats, keep the caller's order
+        elif every is not None or agg is not None:
+            raise ValueError("'every' and 'agg' only apply to mode 'aggregate'")
+
         min_duration = args.get("min_duration", 0)
         if isinstance(min_duration, bool) or not isinstance(min_duration, (int, float)) or min_duration < 0:
             raise ValueError("'min_duration' must be a non-negative number of seconds")
-        fmt, _tz = self._time_formatter(args)
+        if min_duration and mode in ("snapshot", "aggregate"):
+            raise ValueError(f"'min_duration' does not apply to mode '{mode}'")
 
-        df = self.viewer.dataframes[path]
-        if column not in df.columns:
-            raise ValueError(f"unknown column {column!r}; call list_series(file='{path}') for the names")
+        drop_dominant = bool(args.get("drop_dominant", False))
+        if drop_dominant and mode != "segments":
+            raise ValueError("'drop_dominant' only applies to mode 'segments'")
+
+        return {"mode": mode, "max_points": max_points, "group_by": group_by, "every": every,
+                "agg": agg, "min_duration": min_duration, "drop_dominant": drop_dominant}
+
+    def _window_one(self, path, df, column, t1, t2, fmt, opts):
+        """One signal over one window, in whichever mode the options picked."""
+        mode = opts["mode"]
+        ss = self.viewer.series.get((path, column))
+        out = {"column": column, "kind": ss.kind if ss is not None else "analog", "mode": mode}
+
+        if mode == "snapshot":
+            return self._snapshot_one(out, df, column, t2, fmt)
 
         start, stop = self._window_slice(df, t1, t2)
         index = df.index.to_numpy()[start:stop]
         values = df[column].to_numpy()[start:stop]
-        ss = self.viewer.series.get((path, column))
-
-        out = {"file": path, "column": column,
-               "kind": ss.kind if ss is not None else "analog",
-               "t1": fmt(t1), "t2": fmt(t2), "tz": _offset_text(self.viewer.x_axis.utcOffset),
-               "samples": int(len(values))}
+        out["samples"] = int(len(values))
         if len(values) == 0:
-            out["mode"] = mode
             out["window_too_small"] = True
             if mode == "summary":
-                out["group_by"] = group_by
+                out["group_by"] = opts["group_by"]
                 out["segments"] = 0
                 out["transitions"] = 0
                 out["groups"] = []
+            elif mode == "aggregate":
+                out["bucket_count"] = 0
+                out["buckets"] = []
             else:
                 out[mode] = []
             return out
 
         last_sample = float(index[-1]) / 1e9
+        out["sample_start"] = fmt(float(index[0]) / 1e9)
+        out["sample_end"] = fmt(last_sample)
+        if len(values) < 2:
+            # One sample cannot show a change; the value below is all there is to report.
+            out["window_too_small"] = True
+
+        if mode == "aggregate":
+            return self._aggregate_window(out, index, values, opts, fmt)
+
         # A window may run past the last sample. A value cannot hold where no sample exists,
         # so clamp to the data and say so instead of letting the last run swell to fill t2.
         # (No clamp is needed at the start: the first segment already begins at the first
@@ -2987,27 +3117,22 @@ class McpBridge(QObject):
         if window_end < t2:
             out["held_truncated"] = True
 
-        out["sample_start"] = fmt(float(index[0]) / 1e9)
-        out["sample_end"] = fmt(last_sample)
-        if len(values) < 2:
-            # One sample cannot show a change; the value below is all there is to report.
-            out["window_too_small"] = True
-
         starts = _segment_starts(values)
         times = index[starts] / 1e9                  # a segment starts here ...
         seg_values = values[starts]
-        if min_duration > 0:
-            kept = _drop_short_runs(times, float(min_duration), window_end)
+        if opts["min_duration"] > 0:
+            kept = _drop_short_runs(times, float(opts["min_duration"]), window_end)
             if len(kept) != len(times):
-                out["min_duration"] = float(min_duration)
+                out["min_duration"] = float(opts["min_duration"])
                 out["segments_before"] = int(len(times))
             times, seg_values = _merge_equal_runs(times[kept], seg_values[kept])
         ends = np.append(times[1:], window_end)      # ... and ends where the next one starts
 
         if mode == "summary":
-            return self._summary_window(out, times, ends, seg_values, group_by, max_points)
+            return self._summary_window(out, times, ends, seg_values, opts["group_by"],
+                                        opts["max_points"])
 
-        if drop_dominant:
+        if opts["drop_dominant"]:
             held = {}
             for value, span in zip(seg_values, ends - times):
                 key = _json_value(value)
@@ -3016,13 +3141,13 @@ class McpBridge(QObject):
             deviations = [[fmt(t), fmt(e), _json_value(v)]
                           for t, e, v in zip(times, ends, seg_values)
                           if _json_value(v) != dominant]
-            if len(deviations) <= max_points:
+            if len(deviations) <= opts["max_points"]:
                 out["mode"] = "deviations"
                 out["dominant"] = dominant
                 out["deviations"] = deviations
                 return out
 
-        if len(times) > max_points:
+        if len(times) > opts["max_points"]:
             return self._dense_window(out, values, index, times, fmt)
 
         if mode == "transitions":
@@ -3036,6 +3161,62 @@ class McpBridge(QObject):
 
         out["mode"] = "segments"
         out["segments"] = [[fmt(t), _json_value(v)] for t, v in zip(times, seg_values)]
+        return out
+
+    def _snapshot_one(self, out, df, column, t, fmt):
+        """The last sample at or before t: what one instant of this recording looks like."""
+        position = int(df.index.searchsorted(self._to_ns(t), side="right")) - 1
+        if position < 0:
+            out["sample_time"] = None
+            out["value"] = None
+            out["no_sample"] = True
+            return out
+        out["sample_time"] = fmt(float(df.index[position]) / 1e9)
+        out["value"] = _json_value(df[column].iat[position])
+        return out
+
+    def _aggregate_window(self, out, index, values, opts, fmt):
+        """Bucket the samples into fixed-width time slices and reduce each bucket.
+
+        Buckets start on multiples of `every` since the epoch, so two calls over overlapping
+        windows describe the same slices. The caller picks `every`, which is why a bucket count
+        over budget is an argument error rather than a silent truncation: dropping buckets would
+        hide exactly what this mode exists to show.
+        """
+        every, agg = float(opts["every"]), opts["agg"]
+        if values.dtype.kind in "OUS":
+            raise ValueError(f"'mode' 'aggregate' needs a numeric signal; "
+                             f"{out['column']!r} holds text")
+
+        numbers = values.astype(float)
+        starts = np.floor(index / 1e9 / every) * every
+        unique, first = np.unique(starts, return_index=True)
+        if len(unique) > opts["max_points"]:
+            span = float(unique[-1] - unique[0]) + every
+            raise ValueError(
+                f"'every'={every} would give {len(unique)} buckets (max {opts['max_points']}); "
+                f"use every >= {int(np.ceil(span / opts['max_points']))} or raise max_points"
+            )
+
+        ends = np.append(first[1:], len(starts))
+        out["every"] = every
+        out["agg"] = list(agg)
+        out["bucket_count"] = int(len(unique))
+        buckets = []
+        for bucket_start, lo, hi in zip(unique, first, ends):
+            chunk = numbers[lo:hi]
+            known = not np.isnan(chunk).all()
+            row = {"t": fmt(float(bucket_start)), "count": int(hi - lo)}
+            if "min" in agg:
+                row["min"] = float(np.nanmin(chunk)) if known else None
+            if "max" in agg:
+                row["max"] = float(np.nanmax(chunk)) if known else None
+            if "first" in agg:
+                row["first"] = _json_value(values[lo])
+            if "last" in agg:
+                row["last"] = _json_value(values[hi - 1])
+            buckets.append(row)
+        out["buckets"] = buckets
         return out
 
     def _summary_window(self, out, times, ends, seg_values, group_by, max_points):
@@ -3124,6 +3305,124 @@ class McpBridge(QObject):
         if len(distinct) <= MCP_MAX_DISTINCT_VALUES:
             # a low-cardinality numeric is really a code, so show how the window splits
             out["values"] = {str(_json_value(v)): int(np.count_nonzero(numbers == v)) for v in distinct}
+        return out
+
+
+    def _tool_find_text(self, args):
+        """Search signal values for a pattern, testing each distinct value once.
+
+        The window is deduplicated before any matching, so a column repeating one line 300 000
+        times costs what one line costs -- which is what makes a whole-file text search cheap.
+        Nothing here knows what the text means: the pattern comes from the caller.
+        """
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("'pattern' must be a non-empty string")
+        if len(pattern) > MCP_MAX_PATTERN:
+            raise ValueError(f"'pattern' must be at most {MCP_MAX_PATTERN} characters")
+        use_regex = bool(args.get("regex", False))
+        ignore_case = bool(args.get("ignore_case", False))
+        limit = self._positive_int(args.get("limit", MCP_MAX_TEXT_MATCHES), "limit")
+        fmt, _tz = self._time_formatter(args)
+
+        compiled = None
+        if use_regex:
+            if MCP_REGEX_NESTED_QUANTIFIER.search(pattern):
+                raise ValueError("'pattern' nests quantifiers like (a+)+, which can take "
+                                 "exponential time; rewrite it without the nesting")
+            try:
+                compiled = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+            except re.error as exc:
+                raise ValueError(f"'pattern' is not a valid regular expression: {exc}")
+        else:
+            needle = pattern.casefold() if ignore_case else pattern
+
+        requested = args.get("file")
+        targets = [self._resolve_file(requested)] if requested else list(self.viewer.dataframes)
+        wanted = args.get("columns")
+        if wanted is not None and (not isinstance(wanted, list) or not wanted
+                                   or not all(isinstance(name, str) and name for name in wanted)):
+            raise ValueError("'columns' must be a non-empty list of signal names")
+        lower = args.get("t1")
+        upper = args.get("t2")
+        t1 = self._window_time(lower, "t1") if lower is not None else None
+        t2 = self._window_time(upper, "t2") if upper is not None else None
+        if t1 is not None and t2 is not None and t1 > t2:
+            raise ValueError(f"t1 ({t1}) must be <= t2 ({t2})")
+
+        deadline = time.perf_counter() + MCP_TEXT_SEARCH_TIMEOUT
+        files, series, matches, not_searched = [], [], [], []
+        found = 0
+        for path in targets:
+            df = self.viewer.dataframes[path]
+            for name in wanted or ():
+                if name not in df.columns:
+                    raise ValueError(f"unknown column {name!r}; call "
+                                     f"list_series(file='{path}') for the names")
+
+            # Omitted bounds mean the whole file, taken exactly (a float round trip through
+            # Unix seconds would otherwise clip the first or last sample).
+            start = 0 if t1 is None else int(df.index.searchsorted(self._to_ns(t1), side="left"))
+            stop = (len(df) if t2 is None
+                    else int(df.index.searchsorted(self._to_ns(t2), side="right")))
+            columns = (list(wanted) if wanted is not None
+                       else [name for name in df.columns if df[name].dtype.kind in "OUS"])
+            files.append({"file": path,
+                          "t1": fmt(t1 if t1 is not None else float(df.index[0]) / 1e9),
+                          "t2": fmt(t2 if t2 is not None else float(df.index[-1]) / 1e9),
+                          "samples": int(stop - start), "searched_columns": len(columns)})
+
+            for name in columns:
+                if time.perf_counter() > deadline:
+                    not_searched.append(f"{os.path.basename(path)}: {name}")
+                    continue
+                values = df[name].to_numpy()[start:stop]
+                if len(values) == 0:
+                    continue
+
+                codes, uniques = pd.factorize(values)
+                hit = np.zeros(len(uniques), dtype=bool)
+                texts = []
+                for i, value in enumerate(uniques):
+                    if i and i % 1024 == 0 and time.perf_counter() > deadline:
+                        hit = None                    # cut off mid-column: no partial counts
+                        break
+                    try:
+                        text = value if isinstance(value, str) else str(value)
+                        if compiled is not None:
+                            matched = compiled.search(text) is not None
+                        else:
+                            matched = needle in (text.casefold() if ignore_case else text)
+                    except Exception:
+                        matched = False               # one bad value must not sink the search
+                    if matched:
+                        hit[i] = True
+                        if len(texts) < MCP_MAX_MATCHED_VALUES:
+                            texts.append(text)
+                if hit is None:
+                    not_searched.append(f"{os.path.basename(path)}: {name}")
+                    continue
+
+                mask = (codes >= 0) & hit[np.maximum(codes, 0)]
+                count = int(mask.sum())
+                if count == 0:
+                    continue
+                found += count
+                series.append({"file": path, "column": name, "count": count,
+                               "distinct": int(hit.sum()), "values": texts})
+                window = df.index.to_numpy()[start:stop]
+                for position in np.flatnonzero(mask)[:limit]:
+                    matches.append([fmt(float(window[position]) / 1e9), path, name,
+                                    _json_value(values[position])])
+
+        matches.sort(key=lambda row: row[0])
+        out = {"pattern": pattern, "regex": use_regex, "ignore_case": ignore_case,
+               "files": files, "matches_found": found,
+               "series": sorted(series, key=lambda row: -row["count"]),
+               "matches": matches[:limit], "truncated": found > len(matches)}
+        if not_searched:
+            out["timed_out"] = True
+            out["not_searched"] = not_searched
         return out
 
 

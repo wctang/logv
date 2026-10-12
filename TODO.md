@@ -1,6 +1,6 @@
 # TODO — logplot MCP server（外部 agent 控制介面）
 
-狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`），M3–M4 待做。
+狀態：**Phase 1 完成並上線**（2026-10-08；omp 已接線，實測通過）。**Phase 2 唯讀工具**（`list_files` / `list_series` / `find_changes` / `get_window`）已上線。**Phase 2.5 計畫修訂**（2026-10-09：suggest.md 兩輪評價 × 五份真實 log 實測）已成文。**M1 完成**（2026-10-12：W7 家務與語意修正、W8 背壓、W10 載入透明度、W11 契約測試）。**M2 完成**（2026-10-12：W4 `mode="summary"`、W1 `list_series detail`）。**M3 完成**（2026-10-12：W3 多欄與快照、W5 `mode="aggregate"`、W6' `find_text`；覆議點 1 與 3 分別以「覆蓋」與「開放」結案），只剩 M4。
 
 目標：讓外部 agent（omp）透過 MCP 直接驅動**執行中**的 logplot GUI —— 載入 log、查值、繪圖、跳時間點。不在 UI 內養對話框、不管 LLM key。
 
@@ -90,9 +90,10 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 | `list_files()` | `dataframes` → 逐檔 rows / columns / start / end + 載入透明度欄位（M1）；慢掃描由 `file_stats_cache` 快取 | ✅ Phase 2 + M1 |
 | `list_series(file?, detail?)` | `dataframes` + `series` + `active_text_series`：名稱分 numeric / string，附 `plotted` / `text_tracked` / `labels` / `kinds`（不回數值）；`detail=true` 另附 `facts`（M2） | ✅ Phase 2 + M2 |
 | `find_changes(t1, t2, file?, limit?, include_unchanged?, time_format?)` | 逐欄 `shift()` 比較（`_changed_counts`），回有變化的訊號與次數（忙的在前）＋未變動計數；篩選層 | ✅ Phase 2 + M1 |
-| `get_window(file?, column, t1, t2, max_points?, mode?, group_by?, min_duration?, drop_dominant?, time_format?)` | 變化清單（精確 RLE）／`transitions`／`summary`／`deviations`，超出預算轉 `dense`；末端夾限／`held_truncated`／`window_too_small`（M1）、摘要分組（M2） | ✅ Phase 2 + M1 + M2 |
-| `search_text(q)` | `search_input.setText` + `search_global_text()`（:1923） | Phase 2 |
-| `get_view_range` | `main_vb.viewRange()` | Phase 2 |
+| `get_window(file?, column?, columns?, t1, t2, max_points?, mode?, group_by?, every?, agg?, min_duration?, drop_dominant?, time_format?)` | 五種可指定模式（`segments` / `transitions` / `summary` / `aggregate` / `snapshot`）與兩個降級形態（`deviations` / `dense`）；末端夾限／`held_truncated`／`window_too_small`（M1）、摘要分組（M2）、多欄快照與時間桶（M3） | ✅ Phase 2 + M1 + M2 + M3 |
+| `find_text(pattern, regex?, ignore_case?, file?, columns?, t1?, t2?, limit?, time_format?)` | 對窗內去重後的字串值比對，回每欄命中數 / 去重命中值 / 前 N 筆 `[t, file, column, value]` | ✅ M3 |
+| `search_text(q)` | `search_input.setText` + `search_global_text()`（:1923） | Phase 3（M4） |
+| `get_view_range` | `main_vb.viewRange()` | Phase 3（M4） |
 | `plot_series` / `unplot_series` | `column_item.setCheckState()` → `on_item_changed`（:1056） | Phase 3 |
 | `zoom_to(t1, t2)` | `main_vb.setXRange` + 自動算 y 範圍 | Phase 3 |
 | `compute_series(file, col, mode)` | `create_computed_series`（:1321，`1` / `2` / `"abs"`） | Phase 3 |
@@ -115,7 +116,10 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 - **`get_value` 已決議不做**：單點查值對診斷沒有意義（人看的是變化），改由 `find_changes`（篩選）+ `get_window`（變化清單）覆蓋。→ Phase 2.5 覆議點 1：W3 的多欄快照（`t1 == t2`）建議覆蓋此決議，因為實務需求是「某一瞬間 N 條訊號」。
 - **空白（NaN）對空白算「沒變」**：物件欄與數值欄都一樣。`_unchanged_mask()` 是唯一的比較規則（`_segment_starts` / `_change_facts` / `list_series` 的事實層都讀它）；輸出時 NaN 一律轉 `null`（`_json_value`），確保 payload 是合法 JSON（不含 `NaN` 字面值），數值為 0 或空陣列時也不會誤判。
 - **`file` 可省略**：只載入一個檔案時 `get_window` 不必帶 `file`；`file` 也接受唯一 basename（`_resolve_file(..., allow_default=True)`）。多檔時才回錯並列出已載入檔案。
-- **五種 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`，**每段一列**故列數＝段數）／`summary`（M2，搭配 `group_by`：`transition` 或 `value`）／`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）／`dense`（超預算摘要）。四種列舉型模式共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布（= 逐值出現次數；是否為代碼由呼叫端判讀，見 Phase 2.5）。
+- **五種可指定的 `mode`**：`segments`（連續變化清單，預設）／`transitions`（`[t, from, to, held_seconds]`，起始狀態的 `from` 為 `null`，**每段一列**故列數＝段數）／`summary`（M2，搭配 `group_by`：`transition` 或 `value`）／`aggregate`（M3，搭配 `every` 秒與 `agg`，回 `buckets`）／`snapshot`（M3，某一瞬間每欄的最後一筆；`t1 == t2` 時的預設，但明示的 `mode` 優先）。另有兩個**降級**回覆形態：`deviations`（`drop_dominant` 觸發，`[t_start, t_end, value]`，因為已不連續所以端點必須明寫）與 `dense`（超預算摘要）。列舉型模式共用同一個預算規則：**任何形式裝不下 `max_points` 就轉 `dense`**（`max_points` 預設 `MCP_MAX_WINDOW_POINTS`(500)、上限 `MCP_WINDOW_POINT_CAP`(5000)）。`dense` 的數值欄在 distinct ≤ `MCP_MAX_DISTINCT_VALUES`(20) 時也會附 `values` 分布。
+- **`columns=[...]`（M3）**：一次讀多個訊號，回覆把每欄的結果放進 `columns` 清單（外層只剩 `file` / `t1` / `t2` / `tz`）；單一 `column` 維持扁平回覆。`snapshot` 是主要用途 —— 中止瞬間那 7 條訊號一次到手。
+- **`aggregate` 的桶界線對齊 epoch（M3）**：桶起點固定是 `every` 的整數倍，重疊的窗因此描述同一批桶。桶數由呼叫端的 `every` 決定，所以超預算時是**參數錯誤**（訊息附最小可行的 `every`），不是靜默截斷。
+- **`find_text` 只比對窗內去重後的值（M3）**：同一串字重複 30 萬次也只比一次；literal 為預設，`regex=true` 才編譯；防護為 pattern 長度上限、巢狀量詞啟發式拒絕、逐值 try/except、5 s 總時限（見 M3 完成紀錄的殘餘風險）。
 - **`summary` 的預算是例外（M2）**：摘要本身是歸約，列數受群組數限制而非段數，所以 `max_points` 只截斷群組列並在 `groups_truncated: true` 時說明；`group_count` 永遠是完整群組數。
 - **`min_duration`（去抖動）**：短於 N 秒的區段直接丟棄、由前一段延伸覆蓋，去抖後相鄰同值再合併（`_merge_equal_runs`），並回報 `segments_before` 以示透明。**所有模式皆適用**（M1 起；M2 的摘要吃去抖後的段）。`drop_dominant` 只保留「佔用時間最長的值」以外的區間，且僅 `segments` 適用。
 - **`window_too_small`（M1）**：窗內樣本數 < 2 時附此旗標 —— 空窗、只落一個樣本、以及 `t1 == t2` 因 Unix 秒是 float（2026 年解析度約 240 ns）而落在樣本旁，都會出現。單樣本仍回那名值在 `segments` 裡。
@@ -168,10 +172,10 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 |---|---|---|---|
 | W1 | ✅ `list_series detail=true`（M2） | 事實層：`distinct` / `changes` / `constant` / `duplicate_of`（值序列也相同）/ `same_timing_as`（僅時間同步）/ `value_pairs`（時間完全同步且映射為函數，中性命名、≤32 筆） | 五檔皆 <0.3 s（實測 37–40 ms／檔）；200+ 欄檔要標出 44–60 欄「從不變」群組 |
 | W2 | `kind` 解耦 | `segments` / `transitions` / `dense` 只依窗內段數與 `max_points` 決定，不依 `kind`；schema 明寫 `transitions` 對任何欄可用；`list_series` 附 `kind_reason`（distinct=N / 門檻） | `servo_alarm_code_1/2`（值與變化位置相同）走同一路徑；門檻值不動 |
-| W3 | `get_window` 多欄與快照 | `columns=[...]`；`t1 == t2` → `mode="snapshot"`（每欄最後一個 ≤t 的樣本） | 中止 A（07:37:20.308）一次呼叫列出 mode / state / t_play / run / st / en / alarm_data |
+| W3 | ✅ `get_window` 多欄與快照（M3） | `columns=[...]`；`t1 == t2` → `mode="snapshot"`（每欄最後一個 ≤t 的樣本） | 中止 A（07:37:20.308）一次呼叫列出 mode / state / t_play / run / st / en / alarm_data |
 | W4 | ✅ `mode="summary"`（M2） | `group_by="transition"`（from→to 次數、held min/median/max）與 `group_by="value"`（各值佔用時間與次數） | `mpc_ctrl_mode` 全檔 14 組、`playing→halt` = 3、正常場長與三筆中止時間同 suggest.md |
-| W5 | `mode="aggregate"` | `every=N` + `agg=[min,max,last,first]`，dense 時附 `buckets` | `t_play` 5 分鐘窗一眼看出爬到全長後歸零 |
-| W6' | `find_text` | 呼叫端傳 `pattern`（預設 literal，可切 regex）/ `ignore_case` / `columns?` / `t1,t2` / `limit`；回每欄命中數、前 N 筆 `[t, column, value]`、去重命中清單 | `find_text("Halt command received")` 在 htb 101 的 `alarm_data` 與 `log_msg_105` 的 `msg` 都命中；**伺服器內不含任何 `(i:o:s:m:)` 或 `I:stop:` 知識** |
+| W5 | ✅ `mode="aggregate"`（M3） | `every=N` + `agg=[min,max,last,first]`，dense 時附 `buckets` | `t_play` 5 分鐘窗一眼看出爬到全長後歸零 |
+| W6' | ✅ `find_text`（M3） | 呼叫端傳 `pattern`（預設 literal，可切 regex）/ `ignore_case` / `columns?` / `t1,t2` / `limit`；回每欄命中數、前 N 筆 `[t, file, column, value]`、去重命中清單 | `find_text("Halt command received")` 在**兩台控制器的 `alarm_data`** 都命中；`find_text("halt", ignore_case=true)` 在 `log_msg_105` 的 `msg` 命中 37 筆（**msg log 沒有 "Halt command received" 這串字**，見 M3 更正）；**伺服器內不含任何 `(i:o:s:m:)` 或 `I:stop:` 知識** |
 | W7 | ✅ 家務與語意修正（M1） | `unchanged_columns` 改 opt-in（永遠回計數）；`held_seconds` 末端夾限到 `min(t2, 資料末筆)` 並標 `held_truncated`；`min_duration` 描述改為「segments 與 transitions 皆適用」；標 `window_too_small` | `t2` 超過資料末筆時 `held_seconds` 不再隨之膨脹 |
 | W8 | ✅ 背壓（M1） | 待處理 > 8 筆回明確 `server busy`（工具本來就在 GUI thread 序列化） | 併發 73 個呼叫得到可讀錯誤，而非無聲中止 |
 | W9 | viewer 控制（Phase 3） | `plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot` | 算出的異常點能在使用者眼前框出來 |
@@ -191,22 +195,24 @@ omp 端（用戶層 `~/.omp/agent/mcp.json`）：
 ```mermaid
 flowchart LR
   M1["M1 ✅ 2026-10-12<br/>W7 + W8 + W10"] --> M2["M2 ✅ 2026-10-12<br/>W4 + W1"]
-  M2 --> M3["M3<br/>W6' + W3 + W5"]
+  M2 --> M3["M3 ✅ 2026-10-12<br/>W6' + W3 + W5"]
   M3 --> M4["M4<br/>W9"]
   M1 -.-> W11["W11 ✅ 契約測試<br/>mcp_test.py"]
 ```
 
-M1 低風險先落地；M2 是分析層主力（做完後 suggest.md 案例 B 的三行答案由 1 次呼叫取得）；M3 含兩項待覆議決策。
+M1 低風險先落地；M2 是分析層主力（做完後 suggest.md 案例 B 的三行答案由 1 次呼叫取得）；M3 含兩項待覆議決策，結果是「覆蓋」與「開放」。
 
 ### 待覆議
 
-1. **W3 多欄快照**與本檔「`get_value` 已決議不做」衝突——建議覆蓋，因為實際需求是「某一瞬間 N 條訊號」，不是單點查值。
-2. **W9 是否提前** plot / zoom / highlight（suggest.md 兩輪都點名 `plotted` 唯讀是最大缺口）。
-3. **W6' 是否開放具名群組的 regex**（換得結構化輸出，代價是 ReDoS 邊界，需 pattern 長度上限等防護）。
+1. ~~W3 多欄快照與本檔「`get_value` 已決議不做」衝突~~ → **2026-10-12 覆蓋**：W3 的 `t1 == t2` snapshot 已實作，`get_at` 這條決議撤銷（見下方「不做」的註記）。
+2. **W9 是否提前** plot / zoom / highlight（suggest.md 兩輪都點名 `plotted` 唯讀是最大缺口）—— 仍待決，M4 暫照原計畫排在最後。
+3. ~~W6' 是否開放具名群組的 regex~~ → **2026-10-12 開放**：`regex=true` 可用，代價是四道防護（pattern 長度上限 200、只對窗內去重後的值比對、逐值 try/except、5 s 總時限）加上巢狀量詞的啟發式拒絕；殘餘風險見 M3 完成紀錄。
 
 ### 不做（維持決議）
 
-內建任何內容文法解析（alarm / LOG / msg / hex）；以基數自動重判 `kind` 或聲稱「碼表」；通用謂詞引擎 `find_events(prev(x)!=y)`（若日後仍不足，再收斂成 `find_events(column, from, to)`）；`get_at`；`kind` 覆寫參數；headless / stdio；破壞性工具。
+內建任何內容文法解析（alarm / LOG / msg / hex）；以基數自動重判 `kind` 或聲稱「碼表」；通用謂詞引擎 `find_events(prev(x)!=y)`（若日後仍不足，再收斂成 `find_events(column, from, to)`）；`kind` 覆寫參數；headless / stdio；破壞性工具。
+
+（`get_at` 原本列在這裡，2026-10-12 由 W3 的 `t1 == t2` snapshot 覆蓋：一次拿到 N 條訊號在某一瞬間的值，比單點查一欄更有用。）
 
 ## M1 完成紀錄（2026-10-12）
 
@@ -294,11 +300,49 @@ W4（`mode="summary"`）與 W1（`list_series detail=true`）已實作，契約�
 - 因此該處 27.388927 / 28.651019 是 **101 檔**的值；105 檔同三場是 27.387970 / 28.649919 / 287.684010。兩台控制器記錄同一現場事件差約 1 ms，正好對上 suggest.md「同一現場事件、兩台控制器各自記錄」的推論。
 - suggest.md 說 `t_play`/`t_elapsed`/`t_replay_left`「變更數完全相同」是對的，但實際更強：兩檔裡這三欄的**值序列也完全相同**，所以判為 `duplicate_of` 而非「僅同時序」。
 
+## M3 完成紀錄（2026-10-12）
+
+W3 / W5 / W6' 已實作（覆議點 1「覆蓋」、覆議點 3「開放」），契約測試擴充到 **169 項檢查**（同一支 `mcp_test.py`，對部署環境 3.13.3 冷啟動實測全過）。
+
+### 新增的三件事
+
+| 工項 | 介面 |
+|---|---|
+| W3 多欄與快照 | `columns=[...]`（回覆把每欄結果放進 `columns` 清單）與 `mode="snapshot"`（每欄最後一個 ≤t 的樣本；`t1 == t2` 時的預設，明示的 `mode` 優先）。單一 `column` 仍是扁平回覆，既有呼叫端不受影響 |
+| W5 時間桶 | `mode="aggregate"` + `every=N`（秒）+ `agg`（`min` / `max` / `first` / `last`，預設 `min, max, last`）→ `buckets`，每桶 `{t, count, ...agg}` |
+| W6' 文字搜尋 | 新工具 `find_text(pattern, regex?, ignore_case?, file?, columns?, t1?, t2?, limit?, time_format?)` → 每欄命中數 `series[]`（含去重命中值）、前 N 筆 `matches`（`[t, file, column, value]`）、`truncated` |
+
+設計要點：
+
+- **`get_window` 拆成外層信封 + 每欄一次 `_window_one`**：多欄只是把同一份 options 套用在每個名稱上，所以單欄路徑的行為與 M1/M2 逐位元相同（169 項檢查裡舊的 123 項照樣過）。
+- **桶界線對齊 epoch**（`floor(t/every)*every`）：重疊的窗描述同一批桶。桶數是呼叫端用 `every` 決定的，所以超預算時回**參數錯誤並附最小可行的 `every`**，而不是靜默截斷——截斷會藏掉這個模式存在的理由。
+- **`aggregate` 只吃數值欄**，字串欄回明確錯誤（對自由文字取 min/max 沒有意義，靜默給字典序會誤導）。
+- **`find_text` 先對窗內去重再比對**（`pd.factorize` + 一個 distinct 值的命中遮罩），所以 287 960 列、45 273 個相異值的 msg 檔整檔搜尋是 **0.09 s**。
+- **`snapshot` 一列都不碰 ViewBox**，只做一次 `searchsorted`，所以多欄快照是毫秒級。
+
+### 驗證
+
+- 契約測試 `mcp_test.py`：**169/169**（冷啟動）。
+- **W3 的驗收案例**：中止 A（07:37:20.308）一次呼叫列出 7 條訊號 —— `{"mpc_ctrl_mode": "halt", "mpc_ctrl_state": 12, "mpc_ctrl_t_play": 0, "mpc_ctrl_run_1": 0, "mpc_ctrl_st_1": "deactuating", "mpc_ctrl_en_1": 1, "alarm_data": "(i:0 o:1 s:0.1 m:Halt command received)"}`。與 suggest.md 的中止指紋逐項相符（`st_1` 為 actuated→deactuating 的中間值、`en_1` 還在 1，因為伺服要到 +88 ms 才 disable）。另外檢查了 7 欄回報同一個 `sample_time`、`t1 == t2` 一定走 snapshot、資料起點之前的 snapshot 回 `no_sample`、`column` 與 `columns` 同時給會報錯、`columns` 也用於 `summary`（2 欄各 7 組）。
+- **W5 的驗收案例**：`t_play` 5 分鐘窗（橫跨中止 C 那一場）→ 31 桶 × 10 s，從 5 150 爬到 **282 756**（＝81.6 % 全長，不是 346 439），桶最大值單調不降，最後一桶 min=max=last=**0**。另外檢查桶數與窗長一致、每桶 `count` 總和＝`samples`、桶起點是 10 的整數倍、每桶 `min ≤ last ≤ max`，以及 6 種參數錯誤（缺 `every`、`every` 用在別的模式、`agg=["mean"]`、字串欄、`min_duration` 搭配、桶數超預算）。
+- **W6'**：`find_text("Halt command received")` 在**兩台控制器**的 `alarm_data` 命中且回傳值就是那串字；`find_text("halt", ignore_case=true)` 在 msg log 命中 **37** 筆（與 pandas 獨立算出的 37 相符），而大小寫敏感的 `"Halt"` 在該檔命中 0（該檔只有小寫）。**另一條獨立路徑交叉驗證**：`dense` 回覆的值分布（`value_counts`）取最常見的值 V 與其筆數，再用 `regex=true`、`^re.escape(V)$` 搜尋，命中數**完全相符**。另有 `limit` 截斷（清單 5 筆但 `matches_found` 仍 37、`truncated: true`）、literal 模式可含 regex 字元、壞 regex 給明確錯誤、巢狀量詞被拒、pattern 過長被拒、缺 pattern 報錯、預設只搜字串欄、指名 `columns` 只搜那一欄。
+- 冷啟動效能：`load_files` 5 檔 8.9 s（解析為主）、`list_series detail` 39 ms（105 檔）／25 ms（104 檔）、msg 整檔 anchored 搜尋 0.09 s。
+
+### 更正上游文件
+
+- W6' 的驗收原寫「`find_text("Halt command received")` 在 htb 101 的 `alarm_data` 與 `log_msg_105` 的 `msg` 都命中」。**後者不成立**：用 pandas 直接讀 `log-20260101.log_msg_105.csv.zst` 的 `msg` 欄，不分大小寫含 "halt command" 的列數是 **0**（"e-stop" 也是 0），只有 37 列含 "halt"。已改成用「兩台控制器的 `alarm_data` 命中」＋「msg log 的 37 筆 halt」當驗收。
+- 附帶事實：**正常收播不會歸零 `t_play`**（播完後數值保留到下一場開始），只有中止會把該場的計數歸零 —— 所以「爬到全長後歸零」的窗要用中止場（本檔 105 的 C 場），用正常場會看到 346 410 一路保持。
+
+### 殘餘風險（照實說）
+
+- `re` 沒有可中斷的比對，**單一值的災難性回溯仍然會卡住整通呼叫**（到 client 端逾時）。現有防護是：pattern 長度上限 200、巢狀量詞啟發式（`(a+)+` 這類形状直接拒收）、5 s 牆鐘預算在「多個值」層級逐 1024 個值檢查、逐值 try/except。要根治需要換成有時限的 regex 引擎，也就是加依賴，與「零新依賴」的決議衝突。**5 s 預算的路徑本身沒有被測試涵蓋**（要穩定觸發它得先有一個能繞過啟發式又會卡住的 pattern，那正是不能放進契約測試的東西）。
+- `find_text` 每欄最多取 `limit` 筆命中再全域排序取前 `limit` 筆，所以 `matches` 是**時間序的樣本**、不是全部；每欄的完整命中數在 `series[].count`。`truncated` 用「找到的筆數 > 列出的筆數」判定（初版寫成 `len(matches) > limit`，在單欄情況下永遠是 false，這一輪修掉）。
+
 ## 待辦
 
 - [x] **M1 — 低風險（2026-10-12 完成）**：W7 家務／語意修正、W8 背壓、W10 載入透明度、W11 契約測試
 - [x] **M2 — 分析層主力（2026-10-12 完成）**：W4 `mode="summary"`、W1 `list_series detail`
-- [ ] **M3 — 覆議後動工**：W6' `find_text`、W3 多欄與快照、W5 `mode="aggregate"`
+- [x] **M3 — 覆議後動工（2026-10-12 完成）**：W6' `find_text`（開放 regex）、W3 多欄與快照（覆蓋舊決議）、W5 `mode="aggregate"`
 - [ ] **M4 — Phase 3 UI 操作**：W9（`plot_series` / `unplot_series` / `zoom_to` / `highlight_range` / `search_text` / `get_view_range` / `compute_series` / `set_timezone` / `measure_delta` / `screenshot_plot`）
 
 每階段可獨立 smoke test，不必等全鏈路完成；W11 契約測試隨任一段一起跑。
