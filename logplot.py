@@ -57,6 +57,9 @@ MCP_MAX_WINDOW_POINTS = 500    # default segment budget for get_window
 MCP_WINDOW_POINT_CAP = 5000    # hard cap on that budget
 MCP_MAX_CHANGED_SERIES = 500   # default cap on find_changes rows
 MCP_MAX_DISTINCT_VALUES = 20   # cap on the value distribution of a dense string window
+MCP_MAX_PENDING_CALLS = 8      # more than this many calls queued for the GUI thread -> 'server busy'
+MCP_TIMESTAMP_MIN_NS = 631152000 * 1_000_000_000    # 1990-01-01: below this a parse is suspect
+MCP_TIMESTAMP_MAX_NS = 4102444800 * 1_000_000_000   # 2100-01-01: and above it likewise
 MCP_DISCOVERY_PATH = os.path.join(tempfile.gettempdir(), "logplot-mcp.json")
 
 MCP_INSTRUCTIONS = (
@@ -431,6 +434,39 @@ def getOffsetFromUtc():
         utc_offset = time.timezone
     return utc_offset
 
+
+def _changed_counts(window):
+    """Per column, how many samples differ from the previous one. NaN vs NaN did not change.
+
+    Comparing column by column keeps each in its native dtype; going through to_numpy() on
+    the whole frame would box 40M+ elements into a single object array. This is the same rule
+    find_changes answers with, so a column count of 0 here means find_changes calls it
+    unchanged over the same rows.
+    """
+    if len(window) < 2:
+        return np.zeros(window.shape[1], dtype=np.int64)
+    shifted = window.shift()
+    changed = ~(window.eq(shifted) | (window.isna() & shifted.isna()))
+    changed.iloc[0] = False                # nothing precedes the first sample
+    return changed.sum().to_numpy()
+
+
+def _scan_loaded_file(df):
+    """Per-file facts that need a pass over every column: the sampling interval, the largest
+    gap, and the columns that never change value (blank counts as a value, as in find_changes)."""
+    index = df.index.to_numpy()
+    if len(index) > 1:
+        gaps = np.diff(index) / 1e9
+        sampling_median_s, largest_gap_s = float(np.median(gaps)), float(gaps.max())
+    else:
+        sampling_median_s = largest_gap_s = None
+
+    counts = _changed_counts(df)
+    constant = [str(col) for col, count in zip(df.columns, counts) if count == 0]
+    return {"sampling_median_s": sampling_median_s, "largest_gap_s": largest_gap_s,
+            "constant_count": len(constant), "constant_columns": constant}
+
+
 class CSVPlotViewer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -448,6 +484,8 @@ class CSVPlotViewer(QMainWindow):
         self.series = {}        # (file_path, column_name) -> SeriesState
         self.file_items = {}    # file_path -> QStandardItem (for tracking tree nodes)
         self.active_text_series = set() # 用於追蹤已勾選的字串系列
+        self.load_info = {}     # file_path -> how the file was read (timestamp branch, gaps, failure)
+        self.file_stats_cache = {}  # file_path -> the slow per-file scan, computed on demand
 
         # 初始化搜索功能相關變數
         self.search_results = []
@@ -969,68 +1007,110 @@ class CSVPlotViewer(QMainWindow):
     def load_csv_files(self, file_paths):
         for path in file_paths:
             try:
-                comp = 'zstd' if path.lower().endswith(('.zst', '.zstd')) else 'infer'
-                try:
-                    df = pd.read_csv(path, engine="pyarrow", compression=comp)
-                except Exception:
-                    df = pd.read_csv(path, low_memory=False, keep_default_na=True, engine="c", compression=comp)
-
-                if df.empty or df.shape[1] < 2:
-                    continue
-
-                if df.columns[0] != "timestamp":
-                    df.rename(columns={df.columns[0]: 'timestamp'}, inplace=True)
-
-                if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
-                    try:
-                        # try to detect unit, time must in 1970 ~ 2286
-                        if df['timestamp'][0] < 1e11:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                        elif df['timestamp'][0] < 1e14:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        elif df['timestamp'][0] < 1e17:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='us')
-                        else:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ns')
-
-                    except Exception:
-                        parsed = False
-                        formats = ['%Y-%m-%d %H:%M:%S.%f', '%Y/%m/%d %H:%M', '%Y-%m-%d %H:%M:%S', 'ISO8601']
-                        for fmt in formats:
-                            try:
-                                df['timestamp'] = pd.to_datetime(df['timestamp'], format=fmt)
-                                parsed = True
-                                break
-                            except ValueError:
-                                continue
-                        if not parsed:
-                            df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-                # to datetime64 ns with int64
-                df['timestamp'] = df['timestamp'].astype('datetime64[ns]').astype(np.int64)
-
-                df.set_index('timestamp', inplace=True)
-                if not df.index.is_monotonic_increasing:
-                    df.sort_index(inplace=True)
-
-                # Handle duplicate column names by renaming them (e.g., 'col' -> 'col.0', 'col.1')
-                cols = pd.Series(df.columns)
-                if cols.duplicated().any():
-                    for dup in cols[cols.duplicated()].unique():
-                        dup_indices = cols[cols == dup].index.values
-                        cols[dup_indices] = [f"{dup}.{i}" for i in range(len(dup_indices))]
-                    df.columns = cols
-
-                self.dataframes[path] = df
-
-                self._populate_tree(path, df)
+                df, info = self._read_log_file(path)
             except Exception as e:
+                # Kept for the MCP layer: failed.reason must carry the real error, not a guess.
+                self.load_info[path] = {"failed": f"{type(e).__name__}: {e}"}
                 print(f"Error reading {path}: {e}")
+                continue
+
+            self.dataframes[path] = df
+            self.load_info[path] = info
+            self.file_stats_cache.pop(path, None)
+
+            self._populate_tree(path, df)
 
         if file_paths and self.dataframes:
             global_xmin = min(df.index.min() for df in self.dataframes.values())
             global_xmax = max(df.index.max() for df in self.dataframes.values())
             self.plot_widget.setXRange(global_xmin / 1e9, global_xmax / 1e9, padding=0.05)
+
+    def _read_log_file(self, path):
+        """Read one CSV / CSV.ZST into a timestamp-indexed frame, and say how it was read."""
+        comp = 'zstd' if path.lower().endswith(('.zst', '.zstd')) else 'infer'
+        try:
+            df = pd.read_csv(path, engine="pyarrow", compression=comp)
+        except Exception:
+            df = pd.read_csv(path, low_memory=False, keep_default_na=True, engine="c", compression=comp)
+
+        if df.empty or df.shape[1] < 2:
+            raise ValueError("no data columns (a lone timestamp column cannot be plotted)")
+
+        timestamp_column = str(df.columns[0])
+        if df.columns[0] != "timestamp":
+            df.rename(columns={df.columns[0]: 'timestamp'}, inplace=True)
+
+        branch = "datetime64"       # the CSV already carried a parsed timestamp column
+        if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+            branch = self._parse_timestamp_column(df)
+
+        # to datetime64 ns with int64
+        df['timestamp'] = df['timestamp'].astype('datetime64[ns]').astype(np.int64)
+
+        # Report the file as it arrived: the sort below would hide both of these.
+        raw_index = df['timestamp'].to_numpy()
+        monotonic = bool(len(raw_index) < 2 or np.all(np.diff(raw_index) >= 0))
+        duplicates = int(len(raw_index) - len(np.unique(raw_index)))
+
+        df.set_index('timestamp', inplace=True)
+        if not df.index.is_monotonic_increasing:
+            df.sort_index(inplace=True)
+
+        # Handle duplicate column names by renaming them (e.g., 'col' -> 'col.0', 'col.1')
+        cols = pd.Series(df.columns)
+        if cols.duplicated().any():
+            for dup in cols[cols.duplicated()].unique():
+                dup_indices = cols[cols == dup].index.values
+                cols[dup_indices] = [f"{dup}.{i}" for i in range(len(dup_indices))]
+            df.columns = cols
+
+        info = {
+            "timestamp_column": timestamp_column,   # as written in the CSV, before the rename
+            "timestamp_parse": branch,              # which branch of the chain above matched
+            "monotonic": monotonic,
+            "duplicate_timestamps": duplicates,
+        }
+        if int(df.index[0]) < MCP_TIMESTAMP_MIN_NS or int(df.index[-1]) >= MCP_TIMESTAMP_MAX_NS:
+            # The unit / format guess above probably guessed wrong; say so instead of pretending.
+            info["timestamp_ambiguous"] = True
+        return df, info
+
+    @staticmethod
+    def _parse_timestamp_column(df):
+        """Turn df['timestamp'] into datetimes in place, reporting which branch matched."""
+        try:
+            # try to detect unit, time must in 1970 ~ 2286
+            first = df['timestamp'][0]
+            if first < 1e11:
+                unit = 's'
+            elif first < 1e14:
+                unit = 'ms'
+            elif first < 1e17:
+                unit = 'us'
+            else:
+                unit = 'ns'
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit=unit)
+            return f"unix:{unit}"
+        except Exception:
+            pass
+
+        for fmt in ['%Y-%m-%d %H:%M:%S.%f', '%Y/%m/%d %H:%M', '%Y-%m-%d %H:%M:%S', 'ISO8601']:
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format=fmt)
+                return f"format:{fmt}"
+            except ValueError:
+                continue
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return "inferred"
+
+    def file_summary_stats(self, path):
+        """The slow per-file facts, scanned once per load and then cached."""
+        cached = self.file_stats_cache.get(path)
+        if cached is None:
+            cached = _scan_loaded_file(self.dataframes[path])
+            self.file_stats_cache[path] = cached
+        return cached
 
     def load_signallist_files(self, file_paths, file_item):
         signallist = {}
@@ -1283,6 +1363,9 @@ class CSVPlotViewer(QMainWindow):
             file_item = self.model.item(row)
             if file_item:
                 self.remove_file(file_item)
+        # Loads that never made it into the tree (unreadable files) are dropped here too.
+        self.load_info.clear()
+        self.file_stats_cache.clear()
 
     def remove_file(self, file_item):
         """從應用程式中移除一個檔案及其所有相關資料"""
@@ -1301,6 +1384,8 @@ class CSVPlotViewer(QMainWindow):
                 if ss.value_label:
                     ss.vb.removeItem(ss.value_label)
         self.file_items.pop(file_path, None)
+        self.load_info.pop(file_path, None)
+        self.file_stats_cache.pop(file_path, None)
 
         # 3. 清理已勾選的文字序列
         series_to_remove = {s for s in self.active_text_series if s[0] == file_path}
@@ -1390,6 +1475,7 @@ class CSVPlotViewer(QMainWindow):
             idx += 1
 
         df[new_col_name] = dy
+        self.file_stats_cache.pop(ss.filepath, None)   # a new column can be a constant one
 
         file_item = item.parent()
         insert_row_idx = item.row() + 1
@@ -2250,6 +2336,8 @@ class McpBridge(QObject):
         super().__init__()
         self.viewer = viewer
         self.tools = {}
+        self._pending = 0                  # calls queued for (or running on) the GUI thread
+        self._pending_lock = threading.Lock()
         self._register_tools()
         # AutoConnection + different thread affinity => queued delivery.
         self.call_requested.connect(self._run_job)
@@ -2272,12 +2360,24 @@ class McpBridge(QObject):
         if not isinstance(arguments, dict):
             raise ValueError("'arguments' must be an object")
 
+        with self._pending_lock:
+            if self._pending >= MCP_MAX_PENDING_CALLS:
+                raise RuntimeError(
+                    f"server busy: {self._pending} tool calls are already waiting for the GUI "
+                    f"thread (limit {MCP_MAX_PENDING_CALLS}); send fewer at a time and retry"
+                )
+            self._pending += 1
+
         job = _McpJob(name, arguments)
-        self.call_requested.emit(job)
-        if not job.event.wait(timeout):
-            raise TimeoutError(
-                f"tool '{name}' did not run within {timeout:.0f}s (is a modal dialog open?)"
-            )
+        try:
+            self.call_requested.emit(job)
+            if not job.event.wait(timeout):
+                raise TimeoutError(
+                    f"tool '{name}' did not run within {timeout:.0f}s (is a modal dialog open?)"
+                )
+        finally:
+            with self._pending_lock:
+                self._pending -= 1
         if job.error is not None:
             raise ValueError(job.error)
         return job.result
@@ -2341,8 +2441,9 @@ class McpBridge(QObject):
             "find_changes",
             "Screen which signals changed inside a time window: one row per signal that moved, "
             "with how many times it changed, busiest first. Use it before reading any signal in "
-            "detail. When a single file is in scope, the signals that did not move are named too. "
-            "Signal names are what get_window takes as 'column'.",
+            "detail. Signals that did not move are always counted; ask for them by name with "
+            "include_unchanged (one file at a time). Signal names are what get_window takes as "
+            "'column'.",
             {
                 "type": "object",
                 "properties": {
@@ -2355,6 +2456,9 @@ class McpBridge(QObject):
                                             "(see list_files). Omit to screen every loaded file."},
                     "limit": {"type": "integer",
                               "description": f"Max rows and max unchanged names, default {MCP_MAX_CHANGED_SERIES}."},
+                    "include_unchanged": {"type": "boolean",
+                                          "description": "Also name the signals that did not change. "
+                                                         "Only with a single file in scope."},
                     "time_format": {"type": "string",
                                     "description": "'unix' (default) or 'iso' for the returned times."},
                 },
@@ -2369,11 +2473,12 @@ class McpBridge(QObject):
             "[time, value] segments, each value holding until the next segment and the last "
             "until t2, which is exact and complete whenever the signal changes few times. "
             "mode 'transitions' returns one row per change instead ([time, from, to, "
-            "held_seconds]). min_duration drops runs shorter than N seconds and drop_dominant "
-            "keeps only the runs that are not the value holding the most time -- both turn "
-            "per-second jitter into the events that matter. If what is left does not fit "
-            "max_points the reply becomes a bounded summary (mode 'dense', with stats and a "
-            "value distribution for low-cardinality signals).",
+            "held_seconds]). min_duration drops runs shorter than N seconds in either mode and "
+            "drop_dominant keeps only the runs that are not the value holding the most time -- "
+            "both turn per-second jitter into the events that matter. If what is left does not "
+            "fit max_points the reply becomes a bounded summary (mode 'dense', with stats and a "
+            "value distribution for low-cardinality signals). A window reaching past the last "
+            "sample is clamped to it and flagged held_truncated.",
             {
                 "type": "object",
                 "properties": {
@@ -2383,7 +2488,9 @@ class McpBridge(QObject):
                     "column": {"type": "string", "description": "Signal name (see list_series)."},
                     "t1": {"type": ["number", "string"],
                            "description": "Window start: Unix seconds, or an ISO 8601 timestamp "
-                                          "read in the viewer's timezone."},
+                                          "read in the viewer's timezone. The window is inclusive; "
+                                          "Unix seconds are floats, so a t1 == t2 probe can land "
+                                          "beside a sample and report window_too_small."},
                     "t2": {"type": ["number", "string"],
                            "description": "Window end (inclusive), same formats as t1."},
                     "max_points": {"type": "integer",
@@ -2392,7 +2499,8 @@ class McpBridge(QObject):
                     "mode": {"type": "string",
                              "description": "'segments' (default) or 'transitions'."},
                     "min_duration": {"type": "number",
-                                     "description": "Drop runs shorter than this many seconds. "
+                                     "description": "Drop runs shorter than this many seconds, in "
+                                                    "both 'segments' and 'transitions' mode. "
                                                     "Default 0 = keep every change."},
                     "drop_dominant": {"type": "boolean",
                                       "description": "Only keep runs whose value is not the one "
@@ -2410,7 +2518,7 @@ class McpBridge(QObject):
 
     def _describe_file(self, path, df):
         """The per-file summary shared by load_files and list_files."""
-        return {
+        entry = {
             "file": path,
             "name": os.path.basename(path),
             "rows": int(len(df)),
@@ -2418,6 +2526,10 @@ class McpBridge(QObject):
             "start": float(df.index[0]) / 1e9 if len(df) else None,
             "end": float(df.index[-1]) / 1e9 if len(df) else None,
         }
+        # How the file was read (and whether that read is trustworthy), then the slow scan.
+        entry.update(self.viewer.load_info.get(path, {}))
+        entry.update(self.viewer.file_summary_stats(path))
+        return entry
 
     def _resolve_file(self, name, allow_default=False):
         """Map a 'file' argument to a loaded key: exact, path-normalised, or unique basename.
@@ -2472,7 +2584,8 @@ class McpBridge(QObject):
         for path in wanted:
             df = self.viewer.dataframes.get(path)
             if df is None:
-                failed.append({"file": path, "reason": "not loaded (missing, empty, or unreadable)"})
+                reason = self.viewer.load_info.get(path, {}).get("failed", "not loaded")
+                failed.append({"file": path, "reason": reason})
                 continue
             entry = self._describe_file(path, df)
             if path not in to_load:
@@ -2597,6 +2710,7 @@ class McpBridge(QObject):
         targets = [self._resolve_file(requested)] if requested else list(self.viewer.dataframes)
         limit = self._positive_int(args.get("limit", MCP_MAX_CHANGED_SERIES), "limit")
         single = len(targets) == 1         # only then are bare column names unambiguous
+        want_unchanged = single and bool(args.get("include_unchanged", False))
 
         files, moved, unchanged, still = [], [], 0, []
         for path in targets:
@@ -2607,21 +2721,18 @@ class McpBridge(QObject):
 
             if len(window) < 2:
                 unchanged += int(df.shape[1])
-                if single:
+                if want_unchanged:
                     still.extend(str(c) for c in df.columns)
                 continue
 
             # Per-column comparison keeps each column in its native dtype; going through
             # to_numpy() here would box 40M+ elements into one object array.
             # NaN vs NaN did not change; everything else compares by value.
-            shifted = window.shift()
-            changed = ~(window.eq(shifted) | (window.isna() & shifted.isna()))
-            changed.iloc[0] = False             # nothing precedes the first sample
-            for col, count in zip(df.columns, changed.sum().to_numpy()):
+            for col, count in zip(df.columns, _changed_counts(window)):
                 count = int(count)
                 if count == 0:
                     unchanged += 1
-                    if single:
+                    if want_unchanged:
                         still.append(str(col))
                     continue
                 ss = self.viewer.series.get((path, col))
@@ -2633,7 +2744,7 @@ class McpBridge(QObject):
         out = {"t1": fmt(t1), "t2": fmt(t2), "tz": _offset_text(self.viewer.x_axis.utcOffset),
                "files": files, "changed_series": len(moved), "unchanged_series": unchanged,
                "truncated": len(moved) > limit, "series": moved[:limit]}
-        if single:
+        if want_unchanged:
             out["unchanged_columns"] = still[:limit]
             out["unchanged_truncated"] = len(still) > limit
         return out
@@ -2674,21 +2785,34 @@ class McpBridge(QObject):
         if len(values) == 0:
             out["mode"] = mode
             out[mode] = []
+            out["window_too_small"] = True
             return out
 
+        last_sample = float(index[-1]) / 1e9
+        # A window may run past the last sample. A value cannot hold where no sample exists,
+        # so clamp to the data and say so instead of letting the last run swell to fill t2.
+        # (No clamp is needed at the start: the first segment already begins at the first
+        # sample, which sample_start reports.)
+        window_end = min(t2, last_sample)
+        if window_end < t2:
+            out["held_truncated"] = True
+
         out["sample_start"] = fmt(float(index[0]) / 1e9)
-        out["sample_end"] = fmt(float(index[-1]) / 1e9)
+        out["sample_end"] = fmt(last_sample)
+        if len(values) < 2:
+            # One sample cannot show a change; the value below is all there is to report.
+            out["window_too_small"] = True
 
         starts = _segment_starts(values)
         times = index[starts] / 1e9                  # a segment starts here ...
         seg_values = values[starts]
         if min_duration > 0:
-            kept = _drop_short_runs(times, float(min_duration), t2)
+            kept = _drop_short_runs(times, float(min_duration), window_end)
             if len(kept) != len(times):
                 out["min_duration"] = float(min_duration)
                 out["segments_before"] = int(len(times))
             times, seg_values = _merge_equal_runs(times[kept], seg_values[kept])
-        ends = np.append(times[1:], t2)              # ... and ends where the next one starts
+        ends = np.append(times[1:], window_end)      # ... and ends where the next one starts
 
         if drop_dominant:
             held = {}
