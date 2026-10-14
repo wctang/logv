@@ -388,7 +388,7 @@ from PySide6.QtCore import Qt, QObject, Signal, QBuffer, QIODevice
 import pyqtgraph as pg
 from pyqtgraph import PlotWidget, DateAxisItem, PlotDataItem
 
-VERSION = "20261012"
+VERSION = "20261014"
 
 # How a series is drawn, decided by counting the distinct values of its whole column
 # (see SeriesState.kind). A string column with >= STRING_TEXT_THRESHOLD distinct values is
@@ -3701,9 +3701,9 @@ class McpBridge(QObject):
             if opts["mode"] not in ("segments", "transitions"):
                 raise ValueError("'fleet' applies to mode 'segments' and 'transitions' only")
             tolerance = args.get("tolerance_s", MCP_FLEET_TOLERANCE_S)
-        if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
-                    or not np.isfinite(tolerance) or tolerance < 0):
-                raise ValueError("'tolerance_s' must be a non-negative number of seconds")
+            if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                        or not np.isfinite(tolerance) or tolerance < 0):
+                    raise ValueError("'tolerance_s' must be a non-negative number of seconds")
         elif args.get("tolerance_s") is not None:
             raise ValueError("'tolerance_s' only applies with fleet=true")
 
