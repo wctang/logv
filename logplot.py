@@ -26,6 +26,355 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from argparse import ArgumentParser
 from datetime import datetime, timezone, timedelta
+# MCP command-line client. Dispatch before importing GUI dependencies.
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_PORT = 8790
+DEFAULT_URL = f"http://127.0.0.1:{DEFAULT_PORT}/mcp"
+PROTOCOL = "2025-06-18"
+DISCOVERY = pathlib.Path(tempfile.gettempdir()) / "logplot-mcp.json"
+LAUNCH_LOG = pathlib.Path(tempfile.gettempdir()) / "logplot-mcp-launch.log"
+DEFAULT_DIR = str(pathlib.Path(__file__).resolve().parent)
+RUNTIME_PYTHON = pathlib.Path(r"D:\log_tools\runtime\python.exe")
+DEFAULT_TIMEOUT = 180.0  # seconds; must exceed the server's 60 s GUI-thread wait
+
+
+class ClientError(Exception):
+    """Transport, protocol, or tool failure — reported on stderr, exit 1."""
+
+
+# --- endpoint -----------------------------------------------------------------
+
+
+def discovery_file():
+    """The GUI's own announcement, or None. Never contains the token."""
+    try:
+        return json.loads(DISCOVERY.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+class Client:
+    def __init__(self, url, token=None, timeout=DEFAULT_TIMEOUT):
+        self.url, self.token, self.timeout = url, token, timeout
+        self._id = 0
+
+    def rpc(self, method, params=None, notify=False, timeout=None):
+        self._id += 1
+        message = {"jsonrpc": "2.0", "method": method}
+        if not notify:
+            message["id"] = self._id
+        if params is not None:
+            message["params"] = params
+        request = urllib.request.Request(
+            self.url, data=json.dumps(message).encode("utf-8"), method="POST")
+        request.add_header("Content-Type", "application/json")
+        request.add_header("Accept", "application/json, text/event-stream")
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            body = exc.read()[:400].decode("utf-8", "replace")
+            if exc.code == 401:
+                raise ClientError(
+                    f"401 unauthorized at {self.url}: this instance requires a Bearer token "
+                    f"(set LOGPLOT_MCP_TOKEN or pass --token)") from None
+            raise ClientError(f"HTTP {exc.code} from {self.url}: {body}") from None
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise ClientError(f"cannot reach {self.url}: {exc}") from None
+        if notify or not body:
+            return None
+        try:
+            reply = json.loads(body.decode("utf-8"))
+        except Exception:
+            raise ClientError(f"non-JSON reply from {self.url}: {body[:200]!r}") from None
+        if "error" in reply:
+            error = reply["error"] or {}
+            raise ClientError(f"{error.get('message', 'error')} (code {error.get('code')})")
+        return reply.get("result")
+
+    def handshake(self, timeout=None):
+        """initialize + notifications/initialized, as any MCP client must."""
+        info = self.rpc("initialize", {"protocolVersion": PROTOCOL,
+                                       "capabilities": {},
+                                       "clientInfo": {"name": "logplot.py", "version": "1"}},
+                        timeout=timeout)
+        self.rpc("notifications/initialized", {}, notify=True, timeout=timeout)
+        return info or {}
+
+    def tools(self, timeout=None):
+        return (self.rpc("tools/list", {}, timeout=timeout) or {}).get("tools", [])
+
+    def call_tool(self, name, arguments=None):
+        result = self.rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        text = "".join(block.get("text", "") for block in (result or {}).get("content") or []
+                       if block.get("type") == "text")
+        if (result or {}).get("isError"):
+            raise ClientError(text.strip() or "tool reported an error")
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+
+def make_client(args, url=None, timeout=None):
+    url = url or args.url or os.environ.get("LOGPLOT_MCP_URL")
+    if not url:
+        info = discovery_file()
+        url = (info or {}).get("url") or DEFAULT_URL
+    token = args.token or os.environ.get("LOGPLOT_MCP_TOKEN")
+    return Client(url, token, timeout or args.timeout), url
+
+
+# --- commands ------------------------------------------------------------------
+
+
+def cmd_status(args):
+    client, url = make_client(args, timeout=min(args.timeout, 5.0))
+    report = {"url": url, "reachable": False, "discovery_file": None,
+              "discovery_stale": False, "tools": None}
+    info = discovery_file()
+    if info:
+        report["discovery_file"] = str(DISCOVERY)
+        report["discovery"] = info
+    try:
+        banner = client.handshake(timeout=min(args.timeout, 5.0))
+    except ClientError as exc:
+        report["error"] = str(exc)
+        report["discovery_stale"] = bool(info)  # a killed GUI leaves its file behind
+        print(json.dumps(report, ensure_ascii=False, indent=None if args.compact else 2))
+        return 1
+    report["reachable"] = True
+    report["server"] = banner.get("serverInfo")
+    report["instructions"] = banner.get("instructions")
+    report["tools"] = [tool.get("name") for tool in client.tools(timeout=min(args.timeout, 5.0))]
+    print(json.dumps(report, ensure_ascii=False, indent=None if args.compact else 2))
+    return 0
+
+
+def cmd_tools(args):
+    client, _url = make_client(args)
+    client.handshake()
+    tools = client.tools()
+    if args.name:
+        tools = [tool for tool in tools if tool.get("name") == args.name]
+        if not tools:
+            raise ClientError(f"no tool named {args.name!r}")
+    if args.full:
+        payload = tools
+    else:
+        payload = []
+        for tool in tools:
+            description = (tool.get("description") or "").strip().replace("\n", " ")
+            payload.append({"name": tool.get("name"), "description": description[:160]})
+    print(json.dumps(payload, ensure_ascii=False, indent=None if args.compact else 2))
+    return 0
+
+
+def parse_arguments(raw):
+    if raw is None:
+        return {}
+    if raw.startswith("@"):
+        path = pathlib.Path(raw[1:])
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ClientError(f"cannot read arguments file {path}: {exc}") from None
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise ClientError(f"arguments are not valid JSON: {exc}") from None
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ClientError("arguments must be a JSON object")
+    return parsed
+
+
+def cmd_call(args):
+    client, _url = make_client(args)
+    client.handshake()
+    result = client.call_tool(args.tool, parse_arguments(args.arguments))
+    print(json.dumps(result, ensure_ascii=False, indent=None if args.compact else 2))
+    return 0
+
+
+def cmd_batch(args):
+    """One process, one handshake, many tool calls: read JSONL on stdin."""
+    client, _url = make_client(args)
+    client.handshake()
+    status = 0
+    for lineno, line in enumerate(sys.stdin, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            item = json.loads(line)
+            if isinstance(item, (list, tuple)):
+                item = {"tool": item[0], "args": item[1] if len(item) > 1 else {}}
+            elif isinstance(item, str):
+                item = {"tool": item}
+            name = item["tool"]
+            result = client.call_tool(name, item.get("args") or {})
+            record = {"tool": name, "ok": True, "result": result}
+        except ClientError as exc:
+            name = locals().get("name")
+            record = {"tool": name, "ok": False, "error": str(exc)}
+            status = 1
+        except Exception as exc:  # bad JSONL line
+            record = {"tool": None, "ok": False, "error": f"line {lineno}: {exc}"}
+            status = 1
+        print(json.dumps(record, ensure_ascii=False, indent=None if args.compact else None),
+              flush=True)
+    return status
+
+
+def cmd_start(args):
+    """Start the GUI only if the endpoint is not already answering."""
+    url = args.url or os.environ.get("LOGPLOT_MCP_URL") or f"http://127.0.0.1:{args.port}/mcp"
+    token = args.token or os.environ.get("LOGPLOT_MCP_TOKEN")
+    probe = Client(url, token, args.wait)
+    try:
+        probe.handshake(timeout=1.5)
+        print(json.dumps({"started": False, "reason": "endpoint already answering", "url": url},
+                         ensure_ascii=False, indent=None if args.compact else 2))
+        return 0
+    except ClientError:
+        pass
+
+    directory = pathlib.Path(args.logplot_dir or os.environ.get("LOGPLOT_DIR") or DEFAULT_DIR)
+    script = directory / "logplot.py"
+    if not script.exists():
+        raise ClientError(
+            f"logplot.py not found at {script}; set LOGPLOT_DIR or pass --logplot-dir")
+    python = args.python or os.environ.get("LOGPLOT_PYTHON")
+    if not python:
+        python = str(RUNTIME_PYTHON) if RUNTIME_PYTHON.exists() else sys.executable
+    command = [python, str(script), "--mcp-port", str(args.port)]
+    command += [str(path) for path in args.load]
+    environ = dict(os.environ)
+    if token:
+        # Pass the token through the environment, never on the command line
+        # (logplot reads --mcp-token's default from $LOGPLOT_MCP_TOKEN).
+        environ["LOGPLOT_MCP_TOKEN"] = token
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    with open(LAUNCH_LOG, "ab") as log:
+        subprocess.Popen(command, cwd=str(directory), env=environ, stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=log, creationflags=creationflags, close_fds=True)
+
+    deadline = time.monotonic() + args.wait
+    while time.monotonic() < deadline:
+        try:
+            probe.handshake(timeout=1.5)
+            print(json.dumps({"started": True, "url": url, "pid": _launched_pid(),
+                              "command": command, "launch_log": str(LAUNCH_LOG)},
+                             ensure_ascii=False, indent=None if args.compact else 2))
+            return 0
+        except ClientError:
+            time.sleep(0.25)
+    raise ClientError(
+        f"started {command[0]} but {url} did not answer within {args.wait:.0f}s; "
+        f"see {LAUNCH_LOG}")
+
+
+def _launched_pid():
+    info = discovery_file()
+    return (info or {}).get("pid")
+
+
+# --- cli -----------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="logplot.py", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--url", help="MCP endpoint (default: discovery file, then "
+                                      f"{DEFAULT_URL})")
+    parser.add_argument("--token", help="Bearer token (default: $LOGPLOT_MCP_TOKEN)")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"per-request seconds (default: {DEFAULT_TIMEOUT:.0f})")
+    parser.add_argument("--compact", action="store_true", help="one-line JSON output")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status", help="report whether the GUI is reachable and where")
+
+    tools = sub.add_parser("tools", help="list the server's tools")
+    tools.add_argument("--full", action="store_true", help="include inputSchema")
+    tools.add_argument("--name", help="only this tool")
+
+    call = sub.add_parser("call", help="run one tool")
+    call.add_argument("tool")
+    call.add_argument("arguments", nargs="?",
+                      help="JSON object, or @file holding one (default: {})")
+
+    sub.add_parser("batch", help="JSONL on stdin: {\"tool\":..,\"args\":..} per line")
+
+    start = sub.add_parser("start", help="start the GUI if the endpoint is down")
+    start.add_argument("--port", type=int, default=DEFAULT_PORT)
+    start.add_argument("--logplot-dir", help="directory holding logplot.py "
+                                             "(default: $LOGPLOT_DIR)")
+    start.add_argument("--python", help="interpreter (default: $LOGPLOT_PYTHON, else the "
+                                        "deployed runtime, else this interpreter)")
+    start.add_argument("--wait", type=float, default=60.0,
+                       help="seconds to wait for the endpoint (default: 60)")
+    start.add_argument("--load", action="append", default=[],
+                       help="log file to load at startup (repeatable)")
+    return parser
+
+
+def mcp_client_main(argv=None):
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    args = build_parser().parse_args(argv)
+    try:
+        return globals()[f"cmd_{args.command}"](args)
+    except ClientError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+
+
+def _is_mcp_client_command(argv):
+    commands = {"status", "tools", "call", "batch", "start"}
+    options_with_values = {"--url", "--token", "--timeout"}
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in options_with_values:
+            index += 2
+        elif any(argument.startswith(option + "=") for option in options_with_values):
+            index += 1
+        elif argument == "--compact":
+            index += 1
+        else:
+            return argument in commands
+    return False
+
+
+if _is_mcp_client_command(sys.argv[1:]):
+    sys.exit(mcp_client_main())
+
 import numpy as np
 import pandas as pd
 from PySide6.QtWidgets import (

@@ -7,6 +7,8 @@ _power-analysis/
 _analysis/
 _tmp/
 docs/
+runtime/
+.uv-cache/
 *.db-shm
 *.db-wal
 *.xz
