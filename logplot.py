@@ -70,6 +70,8 @@ MCP_FLEET_TOLERANCE_S = 1.0    # runs within this many seconds of a cluster's st
 # The classic catastrophic-backtracking shapes, e.g. (a+)+: refused before they ever run.
 MCP_REGEX_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*][^)]*\)[+*]")
 MCP_MAX_PENDING_CALLS = 8      # more than this many calls queued for the GUI thread -> 'server busy'
+MCP_MAX_REQUEST_BYTES = 1024 * 1024  # reject oversized JSON before reading its body
+MCP_REQUEST_READ_TIMEOUT = 10.0
 MCP_TIMESTAMP_MIN_NS = 631152000 * 1_000_000_000    # 1990-01-01: below this a parse is suspect
 MCP_TIMESTAMP_MAX_NS = 4102444800 * 1_000_000_000   # 2100-01-01: and above it likewise
 MCP_DISCOVERY_PATH = os.path.join(tempfile.gettempdir(), "logplot-mcp.json")
@@ -2535,7 +2537,9 @@ def _fleet_rows(runs_by_file, tolerance):
     by_value = {}
     for path, runs in runs_by_file.items():
         for t_start, t_end, value in runs:
-            by_value.setdefault(str(_json_value(value)), []).append((t_start, t_end, path, value))
+            normalized = _json_value(value)
+            by_value.setdefault((type(normalized).__name__, str(normalized)), []).append(
+                (t_start, t_end, path, value))
     rows = []
     for key, items in by_value.items():
         items.sort(key=lambda item: (item[0], item[2]))
@@ -2742,6 +2746,8 @@ class McpBridge(QObject):
             "carries a 'files' list with one entry per file, and a file missing the column "
             "carries an error entry instead of failing the call. With several files loaded, "
             "fleet=true clusters the window's runs across files by value and start time "
+            "after min_duration debounce; it uses all runs even when a per-file reply "
+            "is summarized as dense for the output budget. "
             "(tolerance_s, default 1 s): each fleet row names the value, its first start, its "
             "furthest end and how many files show it -- the answer to 'did several nodes do "
             "this at the same time'.",
@@ -2792,7 +2798,8 @@ class McpBridge(QObject):
                                                      "holding the most time (mode 'segments' only)."},
                     "fleet": {"type": "boolean",
                               "description": "Cluster this window's runs across the loaded files by "
-                                             "value and start time (needs several files and one "
+                                             "value and start time, after min_duration debounce "
+                                             "(needs several files and one "
                                              "'column'; modes 'segments'/'transitions' only). The "
                                              "reply gains a 'fleet' list of {value, t_start, t_end, "
                                              "n_files, files} rows; max_points caps that list and "
@@ -3345,8 +3352,8 @@ class McpBridge(QObject):
             if opts["mode"] not in ("segments", "transitions"):
                 raise ValueError("'fleet' applies to mode 'segments' and 'transitions' only")
             tolerance = args.get("tolerance_s", MCP_FLEET_TOLERANCE_S)
-            if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
-                    or tolerance < 0):
+        if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                    or not np.isfinite(tolerance) or tolerance < 0):
                 raise ValueError("'tolerance_s' must be a non-negative number of seconds")
         elif args.get("tolerance_s") is not None:
             raise ValueError("'tolerance_s' only applies with fleet=true")
@@ -3383,7 +3390,8 @@ class McpBridge(QObject):
                 entry["columns"] = replies
             entries.append(entry)
             if fleet:
-                runs_by_file[path] = self._fleet_runs(df, names[0], t1, t2)
+                runs_by_file[path] = self._fleet_runs(df, names[0], t1, t2,
+                                                      opts["min_duration"])
 
         envelope = {"t1": fmt(t1), "t2": fmt(t2), "tz": tz, "files": entries}
         if not fleet:
@@ -3400,8 +3408,8 @@ class McpBridge(QObject):
             out["fleet"] = out["fleet"][:opts["max_points"]]
         return out
 
-    def _fleet_runs(self, df, column, t1, t2):
-        """One column's runs in one window as (t_start, t_end, value), raw floats and values."""
+    def _fleet_runs(self, df, column, t1, t2, min_duration=0):
+        """One column's runs, with the same debounce as the per-file window."""
         start, stop = self._window_slice(df, t1, t2)
         values = df[column].to_numpy()[start:stop]
         if len(values) == 0:
@@ -3410,8 +3418,12 @@ class McpBridge(QObject):
         starts = _segment_starts(values)
         times = index[starts] / 1e9
         window_end = min(t2, float(index[-1]) / 1e9)
+        run_values = values[starts]
+        if min_duration > 0:
+            kept = _drop_short_runs(times, float(min_duration), window_end)
+            times, run_values = _merge_equal_runs(times[kept], run_values[kept])
         ends = np.append(times[1:], window_end)
-        return list(zip(times.tolist(), ends.tolist(), values[starts].tolist()))
+        return list(zip(times.tolist(), ends.tolist(), run_values.tolist()))
 
     def _window_options(self, args, t1, t2):
         """Validate the mode and its arguments once, for one column or for many."""
@@ -4131,8 +4143,32 @@ class McpHttpServer:
                     self._respond(401, {"error": "unauthorized"})
                     return
 
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length else b""
+                length_header = self.headers.get("Content-Length")
+                try:
+                    length = int(length_header) if length_header is not None else -1
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    self.close_connection = True
+                    self._respond(400, {"error": "valid Content-Length required"})
+                    return
+                if length > MCP_MAX_REQUEST_BYTES:
+                    self.close_connection = True
+                    self._respond(413, {"error": "request body too large"})
+                    return
+                self.connection.settimeout(MCP_REQUEST_READ_TIMEOUT)
+                try:
+                    raw = self.rfile.read(length)
+                except (OSError, TimeoutError):
+                    self.close_connection = True
+                    self._respond(408, {"error": "request body timed out"})
+                    return
+                finally:
+                    self.connection.settimeout(None)
+                if len(raw) != length:
+                    self.close_connection = True
+                    self._respond(400, {"error": "incomplete request body"})
+                    return
                 try:
                     message = json.loads(raw.decode("utf-8"))
                 except Exception:
@@ -4181,7 +4217,7 @@ def main():
         try:
             window.load_csv_files(args.files)
         except Exception as e:
-            print(f"Error loading file {args.file}: {e}")
+            print(f"Error loading files {args.files}: {e}")
     if args.mcp_port:
         try:
             window.start_mcp_server(args.mcp_port, args.mcp_token)
